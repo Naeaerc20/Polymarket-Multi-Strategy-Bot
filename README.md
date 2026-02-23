@@ -45,7 +45,7 @@ Polymarket-Trading-Asset-Bot/
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/Naeaerc20/Polymarket-Trading-Asset-Bot.git
+git clone https://github.com/Naeaerc20/Polymarket-Multi-Strategy-Bot.git
 cd Polymarket-Trading-Asset-Bot
 ```
 
