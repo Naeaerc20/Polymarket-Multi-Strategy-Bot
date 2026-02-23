@@ -1,5 +1,5 @@
 """
-strategies/YES+NO_1usd/xrp/bot.py
+strategies/YES+NO_1usd/markets/xrp/bot.py
 ----------------------------------
 Strategy: YES+NO Arbitrage — buy UP + DOWN when both are inside PRICE_RANGE.
 
@@ -16,8 +16,8 @@ PRICE_RANGE format: "0.40-0.45"  → triggers when price >= 0.40 AND price <= 0.
   XRP_PRICE_RANGE        e.g. "0.40-0.45"
   XRP_AMOUNT_TO_BUY      USDC amount per side (e.g. 1.0)
   XRP_POLL_INTERVAL      seconds between price checks (e.g. 0.5)
-  BUY_ORDER_TYPE              FAK (recommended for this strategy)
-  WSS_READY_TIMEOUT           seconds to wait for WSS (default 10)
+  BUY_ORDER_TYPE                 FAK (recommended for this strategy)
+  WSS_READY_TIMEOUT              seconds to wait for WSS (default 10)
 """
 
 import os
@@ -31,7 +31,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent.parent
+_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 load_dotenv(_ROOT / ".env")
 
 sys.path.insert(0, str(_ROOT))
@@ -66,34 +66,10 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CHAIN_ID  = 137
 
 SLUG_TEMPLATES = {
-    "5m" : "sol-updown-5m-{ts}",
-    "15m": "sol-updown-15m-{ts}",
+    "5m" : "xrp-updown-5m-{ts}",
+    "15m": "xrp-updown-15m-{ts}",
 }
 WINDOW_SECONDS = {"5m": 300, "15m": 900}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  INTERACTIVE PROMPT
-# ══════════════════════════════════════════════════════════════════════════════
-
-def ask_market_interval() -> str:
-    try:
-        import questionary
-        choice = questionary.select(
-            "Select market interval:",
-            choices=["5 minutes", "15 minutes"],
-        ).ask()
-        return "15m" if "15" in choice else "5m"
-    except ImportError:
-        print("\n[!] questionary not installed — using simple prompt")
-        print("    Install with: pip install questionary --break-system-packages\n")
-    except Exception:
-        pass
-    while True:
-        choice = input("Select market interval — enter 5 or 15: ").strip()
-        if choice in ("5", "15"):
-            return f"{choice}m"
-        print("  Please enter 5 or 15")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -112,7 +88,7 @@ def build_clob_client():
     pas  = os.getenv("POLY_API_PASSPHRASE", "")
 
     if not all([pk, fund, key, sec, pas]):
-        log.error("Missing credentials in .env")
+        log.error("Missing credentials in .env — run setup.py first")
         sys.exit(1)
 
     creds  = ApiCreds(api_key=key, api_secret=sec, api_passphrase=pas)
@@ -221,10 +197,8 @@ def fetch_midpoint_rest(token_id: str) -> Optional[float]:
 def get_prices(stream: MarketStream, token_up: str, token_down: str) -> Optional[dict]:
     up_price   = stream.get_midpoint(token_up)
     down_price = stream.get_midpoint(token_down)
-
     if up_price is None:   up_price   = fetch_midpoint_rest(token_up)
     if down_price is None: down_price = fetch_midpoint_rest(token_down)
-
     if up_price is None or down_price is None:
         return None
     return {"UP": up_price, "DOWN": down_price}
@@ -258,8 +232,6 @@ class BotState:
 
     @property
     def combined_price(self) -> float:
-        """Sum of entry prices per share (e.g. 0.44 + 0.425 = 0.865).
-        This is what determines profitability — must be < 1.00."""
         return self.up_price + self.down_price
 
     def summary(self) -> str:
@@ -269,32 +241,15 @@ class BotState:
         if self.bought_down:
             lines.append(f"  DOWN → {self.down_shares:.4f} shares @ {self.down_price:.4f}  spent=${self.down_cost:.4f}")
         if self.both_bought:
-            # Profit is calculated on price per share, not total USDC spent.
-            # Each share pays $1.00 at resolution. Combined entry cost = up_price + down_price.
-            # Profit per share = 1.00 - combined_price  (guaranteed regardless of outcome)
-            combined = self.combined_price
+            combined         = self.combined_price
             profit_per_share = round(1.0 - combined, 4)
-            # Total profit = profit_per_share × min(up_shares, down_shares)
-            # (the matching quantity that guarantees payout on both sides)
-            min_shares   = min(self.up_shares, self.down_shares)
-            total_profit = round(profit_per_share * min_shares, 4)
-            is_profitable = profit_per_share > 0
-            lines.append(
-                f"  Combined price : {self.up_price:.4f} + {self.down_price:.4f}"
-                f" = {combined:.4f} per share"
-            )
-            lines.append(
-                f"  Profit/share   : $1.00 - {combined:.4f}"
-                f" = ${profit_per_share:.4f}  →  {'PROFITABLE ✔' if is_profitable else 'NOT PROFITABLE ✗'}"
-            )
-            lines.append(
-                f"  Est. total P&L : ${profit_per_share:.4f} × {min_shares:.4f} shares"
-                f" = ${total_profit:.4f}"
-            )
-            lines.append(
-                f"  Total spent    : ${self.total_cost:.4f}"
-                f"  (${self.up_cost:.4f} UP + ${self.down_cost:.4f} DOWN)"
-            )
+            min_shares       = min(self.up_shares, self.down_shares)
+            total_profit     = round(profit_per_share * min_shares, 4)
+            is_profitable    = profit_per_share > 0
+            lines.append(f"  Combined price : {self.up_price:.4f} + {self.down_price:.4f} = {combined:.4f} per share")
+            lines.append(f"  Profit/share   : $1.00 - {combined:.4f} = ${profit_per_share:.4f}  →  {'PROFITABLE ✔' if is_profitable else 'NOT PROFITABLE ✗'}")
+            lines.append(f"  Est. total P&L : ${profit_per_share:.4f} × {min_shares:.4f} shares = ${total_profit:.4f}")
+            lines.append(f"  Total spent    : ${self.total_cost:.4f}  (${self.up_cost:.4f} UP + ${self.down_cost:.4f} DOWN)")
         return "\n".join(lines)
 
 
@@ -439,12 +394,25 @@ def run_window(market: dict, executor: OrderExecutor, state: BotState):
 
 def run(interval: Optional[str] = None):
     if interval is None:
-        interval = ask_market_interval()
+        try:
+            import questionary
+            choice = questionary.select(
+                "Select market interval:",
+                choices=["5 minutes", "15 minutes"],
+            ).ask()
+            interval = "15m" if "15" in choice else "5m"
+        except (ImportError, Exception):
+            while True:
+                choice = input("Select market interval — enter 5 or 15: ").strip()
+                if choice in ("5", "15"):
+                    interval = f"{choice}m"
+                    break
+                print("  Please enter 5 or 15")
 
     range_low, range_high = PRICE_RANGE
     log.info("=" * 60)
     log.info("XRP YES+NO Strategy starting")
-    log.info(f"  Market     : SOL {interval.upper()}")
+    log.info(f"  Market     : XRP {interval.upper()}")
     log.info(f"  Range      : {range_low:.2f} – {range_high:.2f}")
     log.info(f"  Buy amount : ${AMOUNT_TO_BUY:.2f} per side")
     log.info(f"  Buy type   : {BUY_ORDER_TYPE}")
