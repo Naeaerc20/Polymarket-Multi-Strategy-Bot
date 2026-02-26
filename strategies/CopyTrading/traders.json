@@ -1,0 +1,40 @@
+{
+  "traders": [
+    {
+      "address": "0xd84c2b6d65dc596f49c7b6aadd6d74ca91e407b9",
+      "nickname": "BoneReader",
+      "enabled": false,
+      "copy_buys": true,
+      "copy_sells": true,
+      "reverse_trading": false,
+      "max_position_size": 1000,
+      "notes": "Crypto Trader Buy 99c to win the bet"
+    },
+    {
+      "address": "0xfcbecc7e5186e88e03445b81f593685d62828f44",
+      "nickname": "ascetic0x",
+      "enabled": false,
+      "copy_buys": true,
+      "copy_sells": true,
+      "reverse_trading": false,
+      "max_position_size": 1000,
+      "notes": "Altcoin Trader"
+    },
+    {
+      "address": "0xdf4cafe4564fe284bbadb56f1b8fbe8c80f4cb89",
+      "nickname": "6yyss",
+      "enabled": true,
+      "copy_buys": true,
+      "copy_sells": true,
+      "reverse_trading": false,
+      "max_position_size": 1000,
+      "notes": "Altcoin Trader"
+    }
+  ],
+  "global_settings": {
+    "enabled": true,
+    "copy_delay_seconds": 0.1,
+    "max_concurrent_trades": 100,
+    "stop_on_error": false
+  }
+}

@@ -1,36 +1,69 @@
 """
 strategies/DCA_Snipe/markets/xrp/bot.py
-------------------
-BTC 15-Minute UP/DOWN Bot for Polymarket.
+-----------------------------------------------
+XRP Up/Down Bot for Polymarket — DCA Snipe strategy.
 
-PRICE FEED — WebSocket first, REST fallback:
-  1. MarketStream (WSS) opens BEFORE monitoring begins
-  2. Waits up to 10s for first book snapshot (confirms subscription)
-  3. All price reads come from the in-memory WSS cache (sub-millisecond)
-  4. If WSS is disconnected on a tick, falls back to REST GET /midpoint once
+═══════════════════════════════════════════════════════════════════════════════
+ROOT CAUSE FIX — "Not Enough Allowance" on SELL orders
+═══════════════════════════════════════════════════════════════════════════════
 
-STOP LOSS BEHAVIOUR:
-  XRP_STOP_LOSS=0.55       → fixed absolute price
-  XRP_STOP_LOSS_OFFSET=0.05→ dynamic = avg_price - 0.05 (recalculates on DCA)
-  XRP_STOP_LOSS=null  AND
-  XRP_STOP_LOSS_OFFSET=null→ stop loss = avg_price (break-even protection)
-                              updated immediately after every BET/DCA fill
+The error was caused by two compounding issues:
 
-ENTRY ARMING:
-  Prices must dip BELOW ENTRY_PRICE at least once before a trigger is valid.
-  Prevents false entries when the window opens with prices already above target.
+1. SHARES OVERESTIMATION on FAK fallback
+   When a FAK buy returns {"success": true} but takingAmount=0 (partial fill or
+   Polymarket not echoing amounts), the bot estimated shares as usdc/price.
+   Due to floating-point imprecision this could give e.g. 1.66666... shares
+   while the CTF contract actually credited 1.6666 (4dp truncated).
+   Attempting to SELL 1.6667 when wallet has 1.6666 → "Not Enough Allowance".
+   FIX: fallback estimate uses ROUND_DOWN to 4dp — always conservative.
 
-.env variables:
-    XRP_ENTRY_PRICE, XRP_AMOUNT_PER_BET, XRP_TAKE_PROFIT
-    XRP_STOP_LOSS          (fixed price | null → break-even mode)
-    XRP_STOP_LOSS_OFFSET   (dynamic offset | null)
-    XRP_BET_STEP           (null | float)
-    XRP_POLL_INTERVAL      (seconds between ticks, used for DCA/SL polling)
+2. STALE TOTAL_SHARES after TP fill
+   If a GTC take-profit order fills while the bot is still in its polling loop
+   (e.g. waiting for DCA trigger), the shares are already sold on-chain.
+   The bot's state.total_shares still holds the old value.
+   On next DCA or bracket replacement it tries to SELL shares it no longer has.
+   FIX: poll open order status each tick. If tp_order_id is no longer open,
+   treat it as filled → log profit → break out of position loop cleanly.
 
-    BUY_ORDER_TYPE=FAK|FOK|GTC
-    SELL_ORDER_TYPE=GTC
-    GTC_TIMEOUT_SECONDS=null|60
-    FOK_GTC_FALLBACK=true
+═══════════════════════════════════════════════════════════════════════════════
+ENTRY ARMING
+═══════════════════════════════════════════════════════════════════════════════
+Both UP and DOWN prices must dip below ENTRY_PRICE at least once before a
+trigger is armed. Prevents false entries when the window opens with prices
+already above the target.
+
+═══════════════════════════════════════════════════════════════════════════════
+STOP LOSS MODES
+═══════════════════════════════════════════════════════════════════════════════
+Fixed:      STOP_LOSS=0.55   STOP_LOSS_OFFSET=null
+            SL bracket order placed at 0.55 always.
+
+Dynamic:    STOP_LOSS=null   STOP_LOSS_OFFSET=0.05
+            SL = avg_entry_price - 0.05
+            Recalculates and replaces SL bracket after every DCA fill.
+
+Break-even: STOP_LOSS=null   STOP_LOSS_OFFSET=null
+            SL = avg_entry_price - 1 tick (zero-loss guaranteed)
+            Updates after every DCA fill.
+
+═══════════════════════════════════════════════════════════════════════════════
+.env variables
+═══════════════════════════════════════════════════════════════════════════════
+XRP_ENTRY_PRICE, XRP_AMOUNT_PER_BET, XRP_TAKE_PROFIT
+XRP_STOP_LOSS          fixed price | null → break-even mode
+XRP_STOP_LOSS_OFFSET   dynamic offset | null
+XRP_BET_STEP           null | float — DCA step
+XRP_POLL_INTERVAL      seconds between ticks
+
+INTERVAL (runtime menu/argument):
+  5m    | 15m | 1h    → timestamp-slug markets (e.g. xrp-updown-1h-1740560400)
+  1h_et              → ET-dated hourly  (e.g. xrp-up-or-down-february-26-10am-et)
+  24h                → daily market     (e.g. xrp-up-or-down-on-february-26)
+
+BUY_ORDER_TYPE=FAK|FOK|GTC
+SELL_ORDER_TYPE=GTC
+GTC_TIMEOUT_SECONDS=null|60
+FOK_GTC_FALLBACK=true
 """
 
 import os
@@ -38,18 +71,26 @@ import sys
 import time
 import logging
 import requests
-from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
 
-# ── Load .env from project root ────────────────────────────────────────────────
-_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
-load_dotenv(_ROOT / ".env")
+# ── Path resolution ────────────────────────────────────────────────────────────
+def _find_root(marker: str) -> Path:
+    p = Path(__file__).resolve().parent
+    for _ in range(12):
+        if (p / marker).exists():
+            return p
+        p = p.parent
+    raise FileNotFoundError(f"Cannot find '{marker}' walking up from {__file__}")
 
-# ── Imports from project root ──────────────────────────────────────────────────
+_ROOT = _find_root("order_executor.py")
+load_dotenv(_ROOT / ".env")
 sys.path.insert(0, str(_ROOT))
+
 from order_executor import OrderExecutor
 from market_stream  import MarketStream
 
@@ -59,41 +100,82 @@ logging.basicConfig(
     format  = "[%(asctime)s][%(levelname)s] - %(message)s",
     datefmt = "%H:%M:%S",
 )
-log = logging.getLogger("XRP-15M")
+log = logging.getLogger("XRP-DCA")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-ENTRY_PRICE    = float(os.getenv("XRP_ENTRY_PRICE",    "0.70"))
-AMOUNT_PER_BET = float(os.getenv("XRP_AMOUNT_PER_BET", "2.50"))
-TAKE_PROFIT    = float(os.getenv("XRP_TAKE_PROFIT",    "0.95"))
-POLL_INTERVAL  = float(os.getenv("XRP_POLL_INTERVAL",  "1.0"))
+def _float_env(key: str, default: float) -> float:
+    v = os.getenv(key, "").strip().lower()
+    try:
+        return float(v) if v not in ("", "null", "none") else default
+    except ValueError:
+        return default
 
-_bet_step_raw  = os.getenv("XRP_BET_STEP",          "null").strip().lower()
-BET_STEP: Optional[float] = None if _bet_step_raw == "null" else float(_bet_step_raw)
+def _optional_float(key: str) -> Optional[float]:
+    v = os.getenv(key, "").strip().lower()
+    if v in ("", "null", "none"):
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        return None
 
-_sl_raw        = os.getenv("XRP_STOP_LOSS",         "null").strip().lower()
-STOP_LOSS: Optional[float] = None if _sl_raw == "null" else float(_sl_raw)
+ENTRY_PRICE      = _float_env("XRP_ENTRY_PRICE",    0.70)
+AMOUNT_PER_BET   = _float_env("XRP_AMOUNT_PER_BET", 1.0)
+TAKE_PROFIT      = _float_env("XRP_TAKE_PROFIT",    0.95)
+POLL_INTERVAL    = _float_env("XRP_POLL_INTERVAL",  0.5)
+BET_STEP         = _optional_float("XRP_BET_STEP")
+STOP_LOSS        = _optional_float("XRP_STOP_LOSS")
+STOP_LOSS_OFFSET = _optional_float("XRP_STOP_LOSS_OFFSET")
 
-_sl_offset_raw = os.getenv("XRP_STOP_LOSS_OFFSET",  "null").strip().lower()
-STOP_LOSS_OFFSET: Optional[float] = None if _sl_offset_raw == "null" else float(_sl_offset_raw)
-
-# STOP_LOSS=null AND STOP_LOSS_OFFSET=null → break-even mode (SL = avg_price)
 SL_BREAKEVEN_MODE = (STOP_LOSS is None) and (STOP_LOSS_OFFSET is None)
 
-BUY_ORDER_TYPE  = (os.getenv("BUY_ORDER_TYPE")  or os.getenv("ORDER_TYPE", "FAK")).upper()
+BUY_ORDER_TYPE  = (os.getenv("BUY_ORDER_TYPE")  or "FAK").upper()
 SELL_ORDER_TYPE = (os.getenv("SELL_ORDER_TYPE") or "GTC").upper()
-GTC_TIMEOUT_RAW = os.getenv("GTC_TIMEOUT_SECONDS", "null").strip().lower()
-GTC_TIMEOUT: Optional[int] = None if GTC_TIMEOUT_RAW == "null" else int(GTC_TIMEOUT_RAW)
 
-# WSS connection timeout before falling back to REST
-WSS_READY_TIMEOUT = float(os.getenv("WSS_READY_TIMEOUT", "10.0"))
+_gtc_raw = os.getenv("GTC_TIMEOUT_SECONDS", "null").strip().lower()
+GTC_TIMEOUT: Optional[int] = None if _gtc_raw == "null" else int(_gtc_raw)
+
+WSS_READY_TIMEOUT = _float_env("WSS_READY_TIMEOUT", 10.0)
 
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 CHAIN_ID  = 137
+
+SLUG_TEMPLATES = {
+    "5m":  "xrp-updown-5m-{ts}",
+    "15m": "xrp-updown-15m-{ts}",
+    "1h":  "xrp-updown-1h-{ts}",
+}
+WINDOW_SECONDS = {"5m": 300, "15m": 900, "1h": 3600, "1h_et": 3600, "24h": 86400}
+
+# ── ET-dated slug helpers ──────────────────────────────────────────────────────
+_COIN_PREFIX = "xrp"
+_MONTH_NAMES = [
+    "", "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+]
+
+def _et_now() -> datetime:
+    """Current datetime in US Eastern Time (DST-aware if zoneinfo available)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York"))
+    except ImportError:
+        return datetime.now(timezone(timedelta(hours=-5)))
+
+def _fmt_slug_1h_et(dt: datetime) -> str:
+    """e.g. xrp-up-or-down-february-26-10am-et"""
+    h12 = dt.hour % 12 or 12
+    ap  = "am" if dt.hour < 12 else "pm"
+    return f"{_COIN_PREFIX}-up-or-down-{_MONTH_NAMES[dt.month]}-{dt.day}-{h12}{ap}-et"
+
+def _fmt_slug_24h(dt: datetime) -> str:
+    """e.g. xrp-up-or-down-on-february-26"""
+    return f"{_COIN_PREFIX}-up-or-down-on-{_MONTH_NAMES[dt.month]}-{dt.day}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -112,7 +194,7 @@ def build_clob_client():
     pas  = os.getenv("POLY_API_PASSPHRASE", "")
 
     if not all([pk, fund, key, sec, pas]):
-        log.error("Missing credentials in .env — run get_credentials.py first")
+        log.error("Missing credentials — run setup.py first")
         sys.exit(1)
 
     creds  = ApiCreds(api_key=key, api_secret=sec, api_passphrase=pas)
@@ -128,8 +210,9 @@ def build_clob_client():
 #  MARKET DISCOVERY
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_current_window_timestamp() -> int:
-    return (int(datetime.now(timezone.utc).timestamp()) // 900) * 900
+def get_current_window_timestamp(interval: str) -> int:
+    window = WINDOW_SECONDS[interval]
+    return (int(datetime.now(timezone.utc).timestamp()) // window) * window
 
 
 def fetch_market(slug: str) -> Optional[dict]:
@@ -146,32 +229,42 @@ def fetch_market(slug: str) -> Optional[dict]:
     return None
 
 
-def wait_for_active_market() -> dict:
-    log.info("Searching for active XRP 15M market ...")
+def wait_for_active_market(interval: str) -> dict:
+    log.info(f"Searching for active XRP {interval.upper()} market ...")
     while True:
-        ts = get_current_window_timestamp()
-        for candidate in [ts, ts + 900]:
-            slug   = f"xrp-updown-15m-{candidate}"
+        if interval in ("5m", "15m", "1h"):
+            window = WINDOW_SECONDS[interval]
+            ts     = get_current_window_timestamp(interval)
+            slugs  = [
+                SLUG_TEMPLATES[interval].format(ts=ts),
+                SLUG_TEMPLATES[interval].format(ts=ts + window),
+            ]
+        elif interval == "1h_et":
+            now   = _et_now()
+            slugs = [_fmt_slug_1h_et(now), _fmt_slug_1h_et(now + timedelta(hours=1))]
+        else:  # "24h"
+            now   = _et_now()
+            slugs = [_fmt_slug_24h(now), _fmt_slug_24h(now + timedelta(days=1))]
+
+        for slug in slugs:
             market = fetch_market(slug)
             if market and market.get("active") and not market.get("closed"):
                 log.info(f"Found market: {slug}")
                 log.info(f"  End date : {market.get('endDate') or market.get('end_date_iso')}")
                 return market
-        log.info("No active market yet — retrying in 15s ...")
+        log.info("No active market — retrying in 15s ...")
         time.sleep(15)
 
 
 def parse_market_tokens(market: dict) -> dict:
-    import json
+    import json as _json
     outcomes = market.get("outcomes",      "[]")
     prices   = market.get("outcomePrices", "[0.5,0.5]")
     tokens   = market.get("clobTokenIds") or market.get("clob_token_ids", "[]")
-
-    outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
-    prices   = [float(p) for p in (json.loads(prices) if isinstance(prices, str) else prices)]
-    tokens   = json.loads(tokens)   if isinstance(tokens, str) else tokens
-
-    result = {}
+    outcomes = _json.loads(outcomes) if isinstance(outcomes, str) else outcomes
+    prices   = [float(p) for p in (_json.loads(prices) if isinstance(prices, str) else prices)]
+    tokens   = _json.loads(tokens)   if isinstance(tokens, str) else tokens
+    result   = {}
     for i, name in enumerate(outcomes):
         key = "UP" if name.lower() in ("up", "yes") else "DOWN"
         result[key] = {
@@ -201,11 +294,73 @@ def get_tick_size_rest(client, token_id: str) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PRICE FEED — WSS primary, REST fallback
+#  REAL BALANCE QUERY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_token_balance(client, token_id: str) -> Optional[float]:
+    """
+    Query the actual on-chain token balance from Polymarket positions API.
+    Returns real shares held, or None if the query fails.
+
+    This is used before placing SELL orders to avoid "Not Enough Allowance"
+    caused by overestimated shares in state.total_shares.
+
+    NOTE: Uses FUNDER address (not EOA). With SignatureType=2, shares are
+    held by the FUNDER account on-chain, not the signing EOA.
+    """
+    try:
+        # SignatureType=2 → shares belong to FUNDER, not EOA
+        funder = getattr(client, "funder", None) or os.getenv("FUNDER_ADDRESS", "")
+        resp = requests.get(
+            f"{CLOB_HOST}/data/positions",
+            params  = {"user": funder, "token_id": token_id},
+            timeout = 5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # Response can be list of positions or dict
+        if isinstance(data, list):
+            for pos in data:
+                if str(pos.get("asset_id", "")) == str(token_id):
+                    raw = pos.get("size", pos.get("balance", 0))
+                    return float(Decimal(str(raw)).quantize(Decimal("0.0001"), rounding=ROUND_DOWN))
+        elif isinstance(data, dict):
+            raw = data.get("size", data.get("balance", 0))
+            if raw:
+                return float(Decimal(str(raw)).quantize(Decimal("0.0001"), rounding=ROUND_DOWN))
+    except Exception as exc:
+        log.warning(f"[balance] Failed to fetch position for token {token_id[:12]}...: {exc}")
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ORDER STATUS CHECK
+# ══════════════════════════════════════════════════════════════════════════════
+
+def is_order_open(client, order_id: str) -> bool:
+    """
+    Returns True if the GTC order is still open/resting in the book.
+    Returns False if it was filled, cancelled, or not found.
+
+    Used to detect when a TP or SL bracket order was silently filled
+    while the bot was in its polling loop.
+    """
+    try:
+        resp = client.get_order(order_id)
+        if not resp or not isinstance(resp, dict):
+            return False
+        status = resp.get("status", "").upper()
+        # OPEN, LIVE, UNMATCHED = still in book
+        return status in ("OPEN", "LIVE", "UNMATCHED", "PENDING")
+    except Exception:
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PRICE FEED
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_midpoint_rest(token_id: str) -> Optional[float]:
-    """REST fallback for when WSS is temporarily disconnected."""
     try:
         resp = requests.get(
             f"{CLOB_HOST}/midpoint", params={"token_id": token_id}, timeout=5
@@ -217,22 +372,54 @@ def fetch_midpoint_rest(token_id: str) -> Optional[float]:
 
 
 def get_prices(stream: MarketStream, token_up: str, token_down: str) -> Optional[dict]:
-    """
-    Read current prices. WSS first, REST fallback per token if needed.
-    Returns {"UP": float, "DOWN": float} or None if both fail.
-    """
-    up_price   = stream.get_midpoint(token_up)
-    down_price = stream.get_midpoint(token_down)
-
-    # REST fallback only when WSS has no data (disconnected or not yet ready)
-    if up_price is None:
-        up_price = fetch_midpoint_rest(token_up)
-    if down_price is None:
-        down_price = fetch_midpoint_rest(token_down)
-
-    if up_price is None or down_price is None:
+    up   = stream.get_midpoint(token_up)   or fetch_midpoint_rest(token_up)
+    down = stream.get_midpoint(token_down) or fetch_midpoint_rest(token_down)
+    if up is None or down is None:
         return None
-    return {"UP": up_price, "DOWN": down_price}
+    return {"UP": up, "DOWN": down}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SAFE SHARES PARSER  — the fix for "Not Enough Allowance"
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_bet_result(resp: dict, fallback_price: float, fallback_usdc: float):
+    """
+    Extract (shares, cost) from order response.
+
+    FIX: When takingAmount is missing or zero (common with FAK orders that don't
+    echo fill amounts), the fallback estimate now uses ROUND_DOWN to 4 decimal
+    places — ensuring we never claim MORE shares than the CTF contract credited.
+
+    Without this fix: 1.00/0.60 = 1.666... → bot records 1.6667 shares
+    CTF contract credits: 1.6666 shares (4dp truncated)
+    SELL order for 1.6667 shares → "Not Enough Allowance" ✗
+
+    With this fix: fallback = floor(1.00/0.60, 4dp) = 1.6666 shares
+    SELL order for ≤ 1.6666 shares → OK ✔
+    """
+    try:
+        shares = float(resp.get("takingAmount", 0))
+        usdc   = float(resp.get("makingAmount", 0))
+
+        if shares > 0:
+            # API returned actual fill amount — still truncate to 4dp for safety
+            shares = float(Decimal(str(shares)).quantize(Decimal("0.0001"), rounding=ROUND_DOWN))
+        else:
+            # Fallback estimate — use ROUND_DOWN to avoid overestimating
+            shares = float(
+                (Decimal(str(fallback_usdc)) / Decimal(str(fallback_price)))
+                .quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+            )
+
+        usdc = usdc if usdc > 0 else fallback_usdc
+        return shares, usdc
+    except Exception:
+        safe_shares = float(
+            (Decimal(str(fallback_usdc)) / Decimal(str(fallback_price)))
+            .quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+        )
+        return safe_shares, fallback_usdc
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -245,7 +432,7 @@ class BotState:
 
     def reset(self):
         self.side                : Optional[str]   = None
-        self.token_id            : Optional[str]   = None
+        self.token_id            : Optional[str]   = None   # LOCKED after first BUY
         self.entry_price         : float           = 0.0
         self.last_bet_price      : float           = 0.0
         self.avg_price           : float           = 0.0
@@ -256,25 +443,21 @@ class BotState:
         self.in_position         : bool            = False
         self.tp_order_id         : Optional[str]   = None
         self.sl_order_id         : Optional[str]   = None
-        # Entry arming: must see price BELOW entry_price at least once
         self.entry_armed         : bool            = False
+        # Tick counter for order status polling (check every N ticks, not every tick)
+        self._ticks_since_status_check : int = 0
 
-    def update_after_bet(self, bet_price: float, usdc_paid: float, shares_received: float):
-        self.total_shares += shares_received
+    def update_after_bet(self, bet_price: float, usdc_paid: float, shares: float):
+        self.total_shares += shares
         self.total_spent  += usdc_paid
         self.avg_price     = self.total_spent / self.total_shares if self.total_shares else bet_price
 
-        # ── Stop loss resolution priority ──────────────────────────────────
-        # 1. STOP_LOSS_OFFSET set → dynamic: avg_price - offset
-        # 2. STOP_LOSS set        → fixed absolute price
-        # 3. Both null            → break-even: SL = avg_price (no loss possible)
         if STOP_LOSS_OFFSET is not None:
             self.effective_stop_loss = round(self.avg_price - STOP_LOSS_OFFSET, 4)
         elif STOP_LOSS is not None:
             self.effective_stop_loss = STOP_LOSS
         else:
-            # Break-even mode: SL always equals current avg_price
-            # Rounds DOWN by 1 tick to avoid immediate self-triggering
+            # Break-even: SL = avg_price - 1 tick (prevents self-trigger)
             self.effective_stop_loss = round(self.avg_price - 0.01, 4)
 
         self.last_bet_price = bet_price
@@ -282,140 +465,125 @@ class BotState:
         self.in_position    = True
 
     def summary(self) -> str:
-        mode   = f"DCA STEP={BET_STEP}" if BET_STEP else "Single bet"
-        sl_val = f"{self.effective_stop_loss:.4f}" if self.effective_stop_loss else "none"
-        if STOP_LOSS_OFFSET:
-            sl_lbl = "(dynamic)"
-        elif SL_BREAKEVEN_MODE:
-            sl_lbl = "(break-even)"
-        elif STOP_LOSS:
-            sl_lbl = "(fixed)"
-        else:
-            sl_lbl = ""
-        tp_id = self.tp_order_id[:10] + "..." if self.tp_order_id else "none"
-        sl_id = self.sl_order_id[:10] + "..." if self.sl_order_id else "none"
+        sl_mode = "(dynamic)" if STOP_LOSS_OFFSET else "(break-even)" if SL_BREAKEVEN_MODE else "(fixed)"
+        sl_val  = f"{self.effective_stop_loss:.4f}{sl_mode}" if self.effective_stop_loss else "none"
+        mode    = f"DCA STEP={BET_STEP}" if BET_STEP else "Single bet"
         return (
-            f"Side={self.side}  Bets={self.bets_count}  "
-            f"Shares={self.total_shares:.4f}  Spent=${self.total_spent:.2f}  "
-            f"AvgP={self.avg_price:.4f}  SL={sl_val}{sl_lbl}  TP={TAKE_PROFIT}\n"
-            f"  [{mode}]  TP_order={tp_id}  SL_order={sl_id}"
+            f"  Side={self.side}  Bets={self.bets_count}  Shares={self.total_shares:.4f}"
+            f"  Spent=${self.total_spent:.2f}  AvgP={self.avg_price:.4f}\n"
+            f"  SL={sl_val}  TP={TAKE_PROFIT}  [{mode}]\n"
+            f"  tp_id={self.tp_order_id or 'none'}  sl_id={self.sl_order_id or 'none'}"
         )
-
-
-def _parse_bet_result(resp: dict, fallback_price: float, fallback_usdc: float):
-    try:
-        shares = float(resp.get("takingAmount", 0))
-        usdc   = float(resp.get("makingAmount", 0))
-        shares = shares if shares > 0 else fallback_usdc / fallback_price
-        usdc   = usdc   if usdc   > 0 else fallback_usdc
-        return shares, usdc
-    except Exception:
-        return fallback_usdc / fallback_price, fallback_usdc
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BRACKET ORDERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def place_brackets(executor: OrderExecutor, state: BotState, tick_size: float):
-    """Cancel existing bracket orders then place fresh TP + SL GTC orders."""
-    for order_id in [state.tp_order_id, state.sl_order_id]:
-        if order_id:
+def place_brackets(executor: OrderExecutor, state: BotState, tick_size: float,
+                   client=None):
+    """
+    Cancel existing brackets then place fresh TP + SL GTC orders.
+
+    Before placing, optionally queries real balance to prevent "Not Enough
+    Allowance". Uses the lower of state.total_shares vs actual wallet balance.
+    """
+    # Cancel old bracket orders
+    for oid in [state.tp_order_id, state.sl_order_id]:
+        if oid:
             try:
-                executor.gtc_tracker.cancel(order_id, log)
+                executor.gtc_tracker.cancel(oid, log)
             except Exception:
                 pass
     state.tp_order_id = None
     state.sl_order_id = None
 
+    # ── Verify shares against real balance ────────────────────────────────────
+    shares_to_sell = state.total_shares
+    if client is not None:
+        real_balance = get_token_balance(client, state.token_id)
+        if real_balance is not None:
+            if real_balance < shares_to_sell:
+                log.warning(
+                    f"  [bracket] Real balance {real_balance:.4f} < state {shares_to_sell:.4f} "
+                    f"— using real balance to avoid allowance error"
+                )
+                shares_to_sell = real_balance
+            else:
+                log.info(f"  [bracket] Balance confirmed: {real_balance:.4f} shares ✔")
+
+    if shares_to_sell < 0.0001:
+        log.warning("  [bracket] Shares too small to place SELL orders — skipping")
+        return
+
     sl_disp = f"{state.effective_stop_loss:.4f}" if state.effective_stop_loss else "none"
     sl_mode = " (break-even)" if SL_BREAKEVEN_MODE else ""
-    log.info(f"  Placing bracket orders:  TP={TAKE_PROFIT}  SL={sl_disp}{sl_mode}")
+    log.info(f"  Placing brackets: TP={TAKE_PROFIT}  SL={sl_disp}{sl_mode}  shares={shares_to_sell:.4f}")
 
     result = executor.place_sell_bracket(
         token_id     = state.token_id,
-        total_shares = state.total_shares,
+        total_shares = shares_to_sell,
         tp_price     = TAKE_PROFIT,
         sl_price     = state.effective_stop_loss,
         tick_size    = tick_size,
     )
-
     state.tp_order_id = result.get("tp_order_id")
     state.sl_order_id = result.get("sl_order_id")
 
     if not state.tp_order_id:
-        log.warning("  TP bracket order failed to place — will monitor manually")
+        log.warning("  TP bracket failed — will monitor price manually")
     if state.effective_stop_loss and not state.sl_order_id:
-        log.warning("  SL bracket order failed to place — will monitor manually")
+        log.warning("  SL bracket failed — will monitor price manually")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN WINDOW LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_window(market: dict, executor: OrderExecutor, state: BotState):
+def run_window(market: dict, executor: OrderExecutor, state: BotState, interval: str):
     tokens     = parse_market_tokens(market)
     end_time   = get_market_end_time(market)
     token_up   = tokens["UP"]["token_id"]
     token_down = tokens["DOWN"]["token_id"]
+    tick_up    = get_tick_size_rest(executor.client, token_up)
+    tick_down  = get_tick_size_rest(executor.client, token_down)
+    client     = executor.client
 
-    # ── REST tick sizes (initial; WSS updates them live via tick_size_change) ──
-    tick_up   = get_tick_size_rest(executor.client, token_up)
-    tick_down = get_tick_size_rest(executor.client, token_down)
-
-    # ── Config display ─────────────────────────────────────────────────────────
-    if STOP_LOSS_OFFSET:
-        sl_cfg = f"SL_OFFSET={STOP_LOSS_OFFSET}(dynamic)"
-    elif SL_BREAKEVEN_MODE:
-        sl_cfg = "SL=avg_price(break-even)"
-    else:
-        sl_cfg = f"SL={STOP_LOSS}(fixed)"
-
-    mode_str  = f"DCA every {BET_STEP} pts" if BET_STEP else "Single bet (no DCA)"
-    gtc_disp  = f"{GTC_TIMEOUT}s" if GTC_TIMEOUT else "none (rests until filled)"
-
-    log.info("=" * 60)
-    log.info(f"Window | Market ID: {market.get('id', '')}")
-    log.info(f"UP   token : {token_up}")
-    log.info(f"DOWN token : {token_down}")
-    log.info(f"End time   : {end_time}")
-    log.info(
-        f"Config     : ENTRY={ENTRY_PRICE}  BET=${AMOUNT_PER_BET}  TP={TAKE_PROFIT}"
-        f"  {sl_cfg}  BUY={BUY_ORDER_TYPE}  SELL={SELL_ORDER_TYPE}  {mode_str}"
+    sl_cfg = (
+        f"SL_OFFSET={STOP_LOSS_OFFSET}(dynamic)" if STOP_LOSS_OFFSET
+        else "SL=avg_price(break-even)" if SL_BREAKEVEN_MODE
+        else f"SL={STOP_LOSS}(fixed)"
     )
-    log.info(f"GTC timeout: {gtc_disp}")
+    mode_str = f"DCA every {BET_STEP} pts" if BET_STEP else "Single bet"
+
+    log.info("=" * 60)
+    log.info(f"  XRP DCA | Market: {market.get('id','')}")
+    log.info(f"  Interval   : {interval.upper()}")
+    log.info(f"  End time   : {end_time}")
+    log.info(f"  ENTRY={ENTRY_PRICE}  BET=${AMOUNT_PER_BET}  TP={TAKE_PROFIT}")
+    log.info(f"  {sl_cfg}  {mode_str}")
+    log.info(f"  BUY={BUY_ORDER_TYPE}  SELL={SELL_ORDER_TYPE}")
     log.info("=" * 60)
 
-    # ── Open WSS channel BEFORE starting the monitoring loop ──────────────────
-    log.info("[WSS] Opening market channel ...")
     stream = MarketStream(asset_ids=[token_up, token_down])
     stream.start()
-
     ready = stream.wait_ready(timeout=WSS_READY_TIMEOUT)
     if ready:
+        tick_up   = stream.get_tick_size(token_up)   or tick_up
+        tick_down = stream.get_tick_size(token_down) or tick_down
+        mid_up    = stream.get_midpoint(token_up)
+        mid_down  = stream.get_midpoint(token_down)
         log.info(
-            f"[WSS] Connected — first book received. "
-            f"UP={stream.get_midpoint(token_up)}  DOWN={stream.get_midpoint(token_down)}"
+            f"[WSS] Connected  "
+            f"UP={f'{mid_up:.4f}' if mid_up else 'pending'}  "
+            f"DOWN={f'{mid_down:.4f}' if mid_down else 'pending'}"
         )
-        # Sync tick sizes from WSS if already updated
-        ts_up   = stream.get_tick_size(token_up)
-        ts_down = stream.get_tick_size(token_down)
-        if ts_up   != tick_up:
-            log.info(f"[WSS] Tick size UP   updated: {tick_up} → {ts_up}")
-            tick_up   = ts_up
-        if ts_down != tick_down:
-            log.info(f"[WSS] Tick size DOWN updated: {tick_down} → {ts_down}")
-            tick_down = ts_down
     else:
-        log.warning(
-            f"[WSS] Not ready after {WSS_READY_TIMEOUT}s — "
-            "will use REST fallback until WSS syncs"
-        )
+        log.warning(f"[WSS] Not ready after {WSS_READY_TIMEOUT}s — using REST fallback")
 
-    # ── Main loop ──────────────────────────────────────────────────────────────
     try:
         while True:
-            # ── Window expiry ──────────────────────────────────────────────
+            # ── Window expiry ──────────────────────────────────────────────────
             now = datetime.now(timezone.utc)
             if end_time and now >= end_time:
                 log.info("Window closed — cancelling all open bracket orders.")
@@ -423,193 +591,217 @@ def run_window(market: dict, executor: OrderExecutor, state: BotState):
                 break
 
             time_left  = (end_time - now).total_seconds() if end_time else 999
-            mins, secs = divmod(int(time_left), 60)
+            _tl        = int(time_left)
+            _hrs       = _tl // 3600
+            _min       = (_tl % 3600) // 60
+            _sec       = _tl % 60
+            time_label = f"{_hrs}h{_min:02d}m" if _hrs > 0 else f"{_min:02d}:{_sec:02d}"
 
-            # ── Sync tick size from WSS (may change near 0.04 / 0.96) ─────
-            tick_up   = stream.get_tick_size(token_up)
-            tick_down = stream.get_tick_size(token_down)
+            # ── Sync tick sizes ────────────────────────────────────────────────
+            tick_up   = stream.get_tick_size(token_up)   or tick_up
+            tick_down = stream.get_tick_size(token_down) or tick_down
 
-            # ── Price read — WSS primary, REST fallback ────────────────────
+            # ── Price read ─────────────────────────────────────────────────────
             prices = get_prices(stream, token_up, token_down)
             if prices is None:
-                log.warning("Price fetch failed (WSS+REST) — skipping tick")
+                log.warning("Price fetch failed — skipping tick")
                 time.sleep(POLL_INTERVAL)
                 continue
 
             up_price   = prices["UP"]
             down_price = prices["DOWN"]
+            src        = "WSS" if stream.is_connected else "REST"
 
-            # ── Tick display ───────────────────────────────────────────────
-            if state.in_position:
-                cp      = up_price if state.side == "UP" else down_price
-                sl_disp = f"{state.effective_stop_loss:.4f}" if state.effective_stop_loss else "none"
-                sl_mode = "(BE)" if SL_BREAKEVEN_MODE else ""
-                log.info(
-                    f"[{mins:02d}:{secs:02d}]  {state.side}={cp:.4f}"
-                    f"  | AvgP={state.avg_price:.4f}  SL={sl_disp}{sl_mode}"
-                    f"  TP={TAKE_PROFIT}  Shares={state.total_shares:.4f}"
-                    f"  {'WSS' if stream.is_connected else 'REST'}"
-                )
-            elif state.entry_armed:
-                log.info(
-                    f"[{mins:02d}:{secs:02d}]  UP={up_price:.4f}  DOWN={down_price:.4f}"
-                    f"  | Waiting for ENTRY={ENTRY_PRICE}"
-                    f"  {'WSS' if stream.is_connected else 'REST'}"
-                )
-
-            # ══════════════════════════════════════════════════════════════
+            # ══════════════════════════════════════════════════════════════════
             #  PHASE 1 — Waiting for entry
-            # ══════════════════════════════════════════════════════════════
+            # ══════════════════════════════════════════════════════════════════
             if not state.in_position:
-                # ── Entry arming ───────────────────────────────────────────
+
+                # ── Entry arming ───────────────────────────────────────────────
                 if not state.entry_armed:
                     if up_price < ENTRY_PRICE and down_price < ENTRY_PRICE:
                         state.entry_armed = True
                         log.info(
-                            f"  Entry armed — prices below ENTRY={ENTRY_PRICE}"
-                            f" (UP={up_price:.4f} DOWN={down_price:.4f})"
+                            f"  Entry armed — prices dipped below {ENTRY_PRICE} "
+                            f"(UP={up_price:.4f} DOWN={down_price:.4f})"
                         )
                     else:
                         log.info(
-                            f"[{mins:02d}:{secs:02d}]  UP={up_price:.4f}  DOWN={down_price:.4f}"
-                            f"  | Waiting for price to dip below ENTRY={ENTRY_PRICE} before arming"
+                            f"[{time_label}]  UP={up_price:.4f}  DOWN={down_price:.4f}"
+                            f"  | Waiting to arm at ENTRY={ENTRY_PRICE}  {src}"
                         )
                         time.sleep(POLL_INTERVAL)
                         continue
 
-                # ── Entry trigger ──────────────────────────────────────────
-                triggered_side  = None
-                triggered_price = None
-                triggered_tick  = 0.01
+                # ── Entry trigger ──────────────────────────────────────────────
+                trig_side  = None
+                trig_price = None
+                trig_tick  = 0.01
 
                 if up_price >= ENTRY_PRICE:
-                    triggered_side, triggered_price, triggered_tick = "UP",   up_price,   tick_up
+                    trig_side, trig_price, trig_tick = "UP",   up_price,   tick_up
                 elif down_price >= ENTRY_PRICE:
-                    triggered_side, triggered_price, triggered_tick = "DOWN", down_price, tick_down
+                    trig_side, trig_price, trig_tick = "DOWN", down_price, tick_down
 
-                if triggered_side:
+                if trig_side:
                     log.info(
-                        f"*** ENTRY TRIGGER: {triggered_side} reached {triggered_price:.4f}"
-                        f" (target={ENTRY_PRICE}) ***"
+                        f"*** ENTRY: {trig_side} @ {trig_price:.4f} >= {ENTRY_PRICE} ***"
                     )
-                    state.side        = triggered_side
-                    state.token_id    = token_up if triggered_side == "UP" else token_down
-                    state.entry_price = triggered_price
+                    # Lock token_id at BUY time — never change it after this point
+                    state.side        = trig_side
+                    state.token_id    = token_up if trig_side == "UP" else token_down
+                    state.entry_price = trig_price
 
                     resp = executor.place_buy(
                         token_id  = state.token_id,
-                        price     = triggered_price,
+                        price     = trig_price,
                         usdc_size = AMOUNT_PER_BET,
-                        tick_size = triggered_tick,
+                        tick_size = trig_tick,
                     )
 
                     if resp and resp.get("success"):
-                        shares, usdc_paid = _parse_bet_result(resp, triggered_price, AMOUNT_PER_BET)
-                        log.info(f"BET #1 placed | shares={shares:.4f} | usdc=${usdc_paid:.2f} | resp={resp}")
-                        state.update_after_bet(triggered_price, usdc_paid, shares)
-                        place_brackets(executor, state, triggered_tick)
-                        log.info(f"State: {state.summary()}")
+                        shares, usdc_paid = _parse_bet_result(resp, trig_price, AMOUNT_PER_BET)
+                        log.info(
+                            f"  BET #1 filled | shares={shares:.4f}  "
+                            f"usdc=${usdc_paid:.4f}  token={state.token_id[:16]}..."
+                        )
+                        state.update_after_bet(trig_price, usdc_paid, shares)
+                        place_brackets(executor, state, trig_tick, client=client)
+                        log.info(state.summary())
                     else:
-                        log.error(f"BET #1 failed — resetting | resp={resp}")
+                        log.error(f"  BET #1 failed — resp={resp}")
                         state.reset()
+                else:
+                    log.info(
+                        f"[{time_label}]  UP={up_price:.4f}  DOWN={down_price:.4f}"
+                        f"  | Armed, waiting for ENTRY={ENTRY_PRICE}  {src}"
+                    )
 
-            # ══════════════════════════════════════════════════════════════
+            # ══════════════════════════════════════════════════════════════════
             #  PHASE 2 — In position
-            #  Bracket orders fill automatically on-chain.
-            #  Loop here handles: fallback TP/SL + DCA + break-even SL update
-            # ══════════════════════════════════════════════════════════════
+            # ══════════════════════════════════════════════════════════════════
             else:
                 cp        = up_price if state.side == "UP" else down_price
                 tick_size = tick_up  if state.side == "UP" else tick_down
 
-                # ── Break-even SL update ────────────────────────────────────
-                # If SL = avg_price mode: update SL bracket every time avg moves
-                # (happens after DCA). If SL order is placed it was already
-                # replaced in place_brackets() after the DCA fill.
-                # Nothing extra needed here — update_after_bet() handles it.
+                log.info(
+                    f"[{time_label}]  {state.side}={cp:.4f}"
+                    f"  AvgP={state.avg_price:.4f}"
+                    f"  SL={state.effective_stop_loss:.4f}"
+                    f"  TP={TAKE_PROFIT}"
+                    f"  Shares={state.total_shares:.4f}"
+                    f"  {src}"
+                )
 
-                # ── Safety fallback: TP ────────────────────────────────────
+                # ── Check if bracket orders were silently filled ───────────────
+                # Poll every 6 ticks (~3s at default 0.5s interval) to avoid
+                # hammering the API on every tick.
+                state._ticks_since_status_check += 1
+                if state._ticks_since_status_check >= 6:
+                    state._ticks_since_status_check = 0
+
+                    # TP filled externally?
+                    if state.tp_order_id and not is_order_open(client, state.tp_order_id):
+                        pnl = (TAKE_PROFIT - state.avg_price) * state.total_shares
+                        log.info(
+                            f"*** TAKE PROFIT FILLED (detected via order status) ***\n"
+                            f"  TP={TAKE_PROFIT}  AvgP={state.avg_price:.4f}"
+                            f"  Shares={state.total_shares:.4f}"
+                            f"  Est. P&L=+${pnl:.4f}"
+                        )
+                        # Cancel the orphaned SL order
+                        executor.gtc_tracker.cancel_all(log)
+                        break
+
+                    # SL filled externally?
+                    if state.sl_order_id and not is_order_open(client, state.sl_order_id):
+                        pnl = (state.effective_stop_loss - state.avg_price) * state.total_shares
+                        log.info(
+                            f"*** STOP LOSS FILLED (detected via order status) ***\n"
+                            f"  SL={state.effective_stop_loss:.4f}  AvgP={state.avg_price:.4f}"
+                            f"  Shares={state.total_shares:.4f}"
+                            f"  Est. P&L=${pnl:.4f}"
+                        )
+                        executor.gtc_tracker.cancel_all(log)
+                        break
+
+                # ── Manual fallback: TP ────────────────────────────────────────
                 if not state.tp_order_id and cp >= TAKE_PROFIT:
-                    log.info(
-                        f"*** TAKE PROFIT (manual fallback): {state.side} at {cp:.4f}"
-                        f" >= {TAKE_PROFIT} — SELLING ALL ***"
-                    )
+                    log.info(f"*** TP FALLBACK: {state.side}={cp:.4f} >= {TAKE_PROFIT} — selling ***")
                     executor.gtc_tracker.cancel_all(log)
+                    real_bal = get_token_balance(client, state.token_id)
+                    sell_shares = real_bal if real_bal is not None else state.total_shares
                     resp = executor.place_sell_immediate(
                         token_id      = state.token_id,
-                        total_shares  = state.total_shares,
+                        total_shares  = sell_shares,
                         current_price = cp,
                         tick_size     = tick_size,
                     )
                     if resp:
-                        pnl = (cp - state.avg_price) * state.total_shares
-                        log.info(f"POSITION CLOSED (TP fallback) | Est. P&L: +${pnl:.2f}")
+                        pnl = (cp - state.avg_price) * sell_shares
+                        log.info(f"  CLOSED (TP fallback) | Est. P&L=+${pnl:.4f}")
                         break
-                    else:
-                        log.error("SELL failed on TP fallback — retrying next tick")
-                        time.sleep(POLL_INTERVAL)
-                        continue
+                    time.sleep(POLL_INTERVAL)
+                    continue
 
-                # ── Safety fallback: SL ────────────────────────────────────
+                # ── Manual fallback: SL ────────────────────────────────────────
                 if (
                     not state.sl_order_id
                     and state.effective_stop_loss is not None
                     and cp <= state.effective_stop_loss
                 ):
-                    if SL_BREAKEVEN_MODE:
-                        sl_label = "(break-even fallback)"
-                    elif STOP_LOSS_OFFSET:
-                        sl_label = "(dynamic fallback)"
-                    else:
-                        sl_label = "(fixed fallback)"
+                    sl_label = (
+                        "(break-even)" if SL_BREAKEVEN_MODE
+                        else "(dynamic)"  if STOP_LOSS_OFFSET
+                        else "(fixed)"
+                    )
                     log.info(
-                        f"*** STOP LOSS {sl_label}: {state.side} at {cp:.4f}"
-                        f" <= {state.effective_stop_loss:.4f} — SELLING ALL ***"
+                        f"*** SL FALLBACK {sl_label}: {state.side}={cp:.4f} "
+                        f"<= {state.effective_stop_loss:.4f} — selling ***"
                     )
                     executor.gtc_tracker.cancel_all(log)
+                    real_bal = get_token_balance(client, state.token_id)
+                    sell_shares = real_bal if real_bal is not None else state.total_shares
                     resp = executor.place_sell_immediate(
                         token_id      = state.token_id,
-                        total_shares  = state.total_shares,
+                        total_shares  = sell_shares,
                         current_price = cp,
                         tick_size     = tick_size,
                     )
                     if resp:
-                        pnl = (cp - state.avg_price) * state.total_shares
-                        log.info(f"POSITION CLOSED (SL fallback) | Est. P&L: ${pnl:.2f}")
+                        pnl = (cp - state.avg_price) * sell_shares
+                        log.info(f"  CLOSED (SL fallback) | Est. P&L=${pnl:.4f}")
                         break
-                    else:
-                        log.error("SELL failed on SL fallback — retrying next tick")
-                        time.sleep(POLL_INTERVAL)
-                        continue
+                    time.sleep(POLL_INTERVAL)
+                    continue
 
-                # ── DCA ───────────────────────────────────────────────────
+                # ── DCA ────────────────────────────────────────────────────────
                 if BET_STEP is not None:
-                    next_bet_price = round(state.last_bet_price + BET_STEP, 4)
-                    if cp >= next_bet_price:
+                    next_bet = round(state.last_bet_price + BET_STEP, 4)
+                    if cp >= next_bet:
                         log.info(
-                            f"*** DCA BET #{state.bets_count + 1}: {state.side} at {cp:.4f}"
-                            f" >= {next_bet_price:.4f} ***"
+                            f"*** DCA #{state.bets_count + 1}: {state.side}={cp:.4f}"
+                            f" >= {next_bet:.4f} ***"
                         )
                         resp = executor.place_buy(
-                            token_id  = state.token_id,
+                            token_id  = state.token_id,  # SAME token as initial buy
                             price     = cp,
                             usdc_size = AMOUNT_PER_BET,
                             tick_size = tick_size,
                         )
                         if resp and resp.get("success"):
                             shares, usdc_paid = _parse_bet_result(resp, cp, AMOUNT_PER_BET)
-                            log.info(f"DCA placed | shares={shares:.4f} | usdc=${usdc_paid:.2f}")
+                            log.info(f"  DCA filled | shares={shares:.4f}  usdc=${usdc_paid:.4f}")
                             state.update_after_bet(cp, usdc_paid, shares)
-                            # Replaces brackets with new totals + updated SL
-                            place_brackets(executor, state, tick_size)
-                            log.info(f"State: {state.summary()}")
+                            # Replace brackets with updated total + new SL
+                            place_brackets(executor, state, tick_size, client=client)
+                            log.info(state.summary())
                         else:
-                            log.error(f"DCA failed — retrying next tick | resp={resp}")
+                            log.error(f"  DCA failed — resp={resp}")
 
             time.sleep(POLL_INTERVAL)
 
     finally:
-        # Always close WSS cleanly when the window ends (normally or on exception)
         log.info("[WSS] Closing market channel.")
         stream.stop()
 
@@ -620,21 +812,45 @@ def run_window(market: dict, executor: OrderExecutor, state: BotState):
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run():
-    if STOP_LOSS_OFFSET:
-        sl_startup = f"SL_OFFSET={STOP_LOSS_OFFSET}(dynamic)"
-    elif SL_BREAKEVEN_MODE:
-        sl_startup = "SL=avg_price(break-even)"
-    else:
-        sl_startup = f"SL={STOP_LOSS}(fixed)"
+def run(interval: Optional[str] = None):
+    if interval is None:
+        try:
+            import questionary
+            choice = questionary.select(
+                "Select market interval:",
+                choices=["5 minutes", "15 minutes", "1 hour", "1 hour (ET dated)", "24 hours"],
+            ).ask()
+            if choice is None:
+                sys.exit(0)
+            interval = {
+                "5 minutes":         "5m",
+                "15 minutes":        "15m",
+                "1 hour":            "1h",
+                "1 hour (ET dated)": "1h_et",
+                "24 hours":          "24h",
+            }[choice]
+        except (ImportError, Exception):
+            while True:
+                c = input("Market interval — enter 5, 15, 60, 1h_et, or 24h: ").strip().lower()
+                if c == "5":     interval = "5m";    break
+                if c == "15":    interval = "15m";   break
+                if c == "60":    interval = "1h";    break
+                if c == "1h_et": interval = "1h_et"; break
+                if c == "24h":   interval = "24h";   break
 
-    gtc_disp = f"{GTC_TIMEOUT}s" if GTC_TIMEOUT else "none"
-    log.info("XRP 15M Bot starting ...")
-    log.info(
-        f"Config: ENTRY={ENTRY_PRICE}  BET=${AMOUNT_PER_BET}  TP={TAKE_PROFIT}"
-        f"  {sl_startup}  BET_STEP={BET_STEP}"
-        f"  BUY={BUY_ORDER_TYPE}  SELL={SELL_ORDER_TYPE}  GTC_TIMEOUT={gtc_disp}"
+    sl_cfg = (
+        f"SL_OFFSET={STOP_LOSS_OFFSET}(dynamic)" if STOP_LOSS_OFFSET
+        else "SL=avg_price(break-even)" if SL_BREAKEVEN_MODE
+        else f"SL={STOP_LOSS}(fixed)"
     )
+
+    log.info("=" * 60)
+    log.info("XRP DCA Snipe starting")
+    log.info(f"  Interval : {interval.upper()}")
+    log.info(f"  ENTRY={ENTRY_PRICE}  BET=${AMOUNT_PER_BET}  TP={TAKE_PROFIT}")
+    log.info(f"  {sl_cfg}  BET_STEP={BET_STEP}")
+    log.info(f"  BUY={BUY_ORDER_TYPE}  SELL={SELL_ORDER_TYPE}")
+    log.info("=" * 60)
 
     client   = build_clob_client()
     executor = OrderExecutor(client=client, log=log)
@@ -642,11 +858,14 @@ def run():
 
     while True:
         state  = BotState()
-        market = wait_for_active_market()
-        run_window(market, executor, state)
+        market = wait_for_active_market(interval)
+        run_window(market, executor, state, interval)
 
         end_time  = get_market_end_time(market)
-        wait_secs = max(5, (end_time - datetime.now(timezone.utc)).total_seconds() + 5) if end_time else 30
+        wait_secs = 30
+        if end_time:
+            remaining = (end_time - datetime.now(timezone.utc)).total_seconds()
+            wait_secs = max(5, remaining + 5)
         log.info(f"Waiting {wait_secs:.0f}s for next window ...")
         time.sleep(wait_secs)
 

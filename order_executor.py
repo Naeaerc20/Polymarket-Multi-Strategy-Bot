@@ -202,6 +202,9 @@ class OrderExecutor:
 
     # ── Internal placement methods ─────────────────────────────────────────────
 
+    # Minimum shares required by Polymarket for GTC limit orders
+    GTC_MIN_SHARES = 5.0
+
     def _place_fok_order(self, token_id: str, price_f: float, size_f: float, side: str):
         args   = OrderArgs(token_id=token_id, price=price_f, size=size_f, side=side)
         signed = self.client.create_order(args)
@@ -214,6 +217,8 @@ class OrderExecutor:
           BUY  → amount = USDC to spend
           SELL → amount = shares to sell
         Falls back to FOK (limit order) if MarketOrderArgs fails.
+        Both attempts are wrapped — returns None instead of raising so the
+        caller can handle a failed order without crashing the bot.
         """
         try:
             margs  = MarketOrderArgs(
@@ -225,9 +230,19 @@ class OrderExecutor:
             return self.client.post_order(signed, OrderType.FAK)
         except Exception as fak_err:
             self._warn(f"  FAK MarketOrderArgs failed ({fak_err}) — falling back to FOK")
-            return self._place_fok_order(token_id, fallback_price, fallback_size, side)
+            try:
+                return self._place_fok_order(token_id, fallback_price, fallback_size, side)
+            except Exception as fok_err:
+                self._warn(f"  FOK fallback also failed ({fok_err}) — order skipped")
+                return None
 
     def _place_gtc_order(self, token_id: str, price_f: float, size_f: float, side: str):
+        if size_f < self.GTC_MIN_SHARES:
+            self._warn(
+                f"  GTC order skipped — size {size_f:.4f} shares < minimum {self.GTC_MIN_SHARES} shares. "
+                f"Increase AMOUNT_PER_BET or lower entry price to meet the GTC minimum."
+            )
+            return None
         args   = OrderArgs(token_id=token_id, price=price_f, size=size_f, side=side)
         signed = self.client.create_order(args)
         return self.client.post_order(signed, OrderType.GTC)

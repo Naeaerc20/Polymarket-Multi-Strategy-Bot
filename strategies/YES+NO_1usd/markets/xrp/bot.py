@@ -1,23 +1,33 @@
 """
 strategies/YES+NO_1usd/markets/xrp/bot.py
 ----------------------------------
-Strategy: YES+NO Arbitrage — buy UP + DOWN when both are inside PRICE_RANGE.
+Strategy: YES+NO Arbitrage — buy UP + DOWN to capture combined cost < $1.00.
 
-LOGIC:
-  - Monitor UP and DOWN prices via WSS (REST fallback)
-  - When UP price is inside PRICE_RANGE  → buy UP  (max 1 buy per window)
-  - When DOWN price is inside PRICE_RANGE → buy DOWN (max 1 buy per window)
-  - Goal: capture UP + DOWN for a combined cost < $1.00 (guaranteed profit at resolution)
-  - No TP, no SL, no DCA — just single FAK buy per side
+MODES (controlled by LOSS_PREVENTION in .env):
 
-PRICE_RANGE format: "0.40-0.45"  → triggers when price >= 0.40 AND price <= 0.45
+  LOSS_PREVENTION=false  (default)
+    Both sides use PRICE_RANGE to trigger a buy.
+    Waits until each side independently enters the range before buying.
+
+  LOSS_PREVENTION=true
+    Uses TRIGGER_RANGE as a "first side" trigger — buys whichever side
+    reaches TRIGGER_RANGE first (the side that has already moved up).
+    Then waits for the opposite side to fall into PRICE_RANGE before buying.
+    This prevents the scenario where one side keeps rising and never returns
+    to the profitable range, leaving a single exposed position.
+
+    Example:
+      TRIGGER_RANGE=0.52-0.54  → buy whichever side hits this first
+      PRICE_RANGE=0.40-0.45    → then buy the opposite side when it drops here
 
 .env variables:
-  XRP_PRICE_RANGE        e.g. "0.40-0.45"
+  XRP_PRICE_RANGE        e.g. "0.40-0.45"  — range for standard buy (both sides if LP=false, second side if LP=true)
+  XRP_TRIGGER_RANGE      e.g. "0.52-0.54"  — range for first-side buy (only used when LOSS_PREVENTION=true)
   XRP_AMOUNT_TO_BUY      USDC amount per side (e.g. 1.0)
   XRP_POLL_INTERVAL      seconds between price checks (e.g. 0.5)
-  BUY_ORDER_TYPE                 FAK (recommended for this strategy)
-  WSS_READY_TIMEOUT              seconds to wait for WSS (default 10)
+  XRP_LOSS_PREVENTION    true | false  (default: false)
+  BUY_ORDER_TYPE                 FAK (recommended)
+  WSS_READY_TIMEOUT              seconds to wait for WSS before REST fallback
 """
 
 import os
@@ -54,8 +64,16 @@ def _parse_range(raw: str):
     parts = raw.strip().split("-")
     return float(parts[0]), float(parts[1])
 
-_range_raw        = os.getenv("XRP_PRICE_RANGE", "0.40-0.45")
+def _parse_bool(raw: str) -> bool:
+    return raw.strip().lower() in ("true", "1", "yes")
+
+_range_raw        = os.getenv("XRP_PRICE_RANGE",   "0.40-0.45")
+_trigger_raw      = os.getenv("XRP_TRIGGER_RANGE", "0.52-0.54")
+_lp_raw           = os.getenv("XRP_LOSS_PREVENTION", "false")
+
 PRICE_RANGE       = _parse_range(_range_raw)
+TRIGGER_RANGE     = _parse_range(_trigger_raw)
+LOSS_PREVENTION   = _parse_bool(_lp_raw)
 AMOUNT_TO_BUY     = float(os.getenv("XRP_AMOUNT_TO_BUY",  "1.0"))
 POLL_INTERVAL     = float(os.getenv("XRP_POLL_INTERVAL",   "0.5"))
 BUY_ORDER_TYPE    = (os.getenv("BUY_ORDER_TYPE") or "FAK").upper()
@@ -213,14 +231,17 @@ class BotState:
         self.reset()
 
     def reset(self):
-        self.bought_up   : bool  = False
-        self.bought_down : bool  = False
-        self.up_shares   : float = 0.0
-        self.down_shares : float = 0.0
-        self.up_cost     : float = 0.0
-        self.down_cost   : float = 0.0
-        self.up_price    : float = 0.0
-        self.down_price  : float = 0.0
+        self.bought_up      : bool          = False
+        self.bought_down    : bool          = False
+        self.up_shares      : float         = 0.0
+        self.down_shares    : float         = 0.0
+        self.up_cost        : float         = 0.0
+        self.down_cost      : float         = 0.0
+        self.up_price       : float         = 0.0
+        self.down_price     : float         = 0.0
+        # Loss prevention: tracks which side was bought via TRIGGER_RANGE
+        # so the bot knows to wait for PRICE_RANGE on the OPPOSITE side only
+        self.trigger_side   : Optional[str] = None  # "UP" | "DOWN" | None
 
     @property
     def both_bought(self) -> bool:
@@ -237,9 +258,11 @@ class BotState:
     def summary(self) -> str:
         lines = ["YES+NO position summary:"]
         if self.bought_up:
-            lines.append(f"  UP   → {self.up_shares:.4f} shares @ {self.up_price:.4f}  spent=${self.up_cost:.4f}")
+            tag = " [trigger]" if self.trigger_side == "UP" else ""
+            lines.append(f"  UP   → {self.up_shares:.4f} shares @ {self.up_price:.4f}  spent=${self.up_cost:.4f}{tag}")
         if self.bought_down:
-            lines.append(f"  DOWN → {self.down_shares:.4f} shares @ {self.down_price:.4f}  spent=${self.down_cost:.4f}")
+            tag = " [trigger]" if self.trigger_side == "DOWN" else ""
+            lines.append(f"  DOWN → {self.down_shares:.4f} shares @ {self.down_price:.4f}  spent=${self.down_cost:.4f}{tag}")
         if self.both_bought:
             combined         = self.combined_price
             profit_per_share = round(1.0 - combined, 4)
@@ -264,6 +287,19 @@ def _parse_buy_result(resp: dict, fallback_price: float, fallback_usdc: float):
         return fallback_usdc / fallback_price, fallback_usdc
 
 
+def _execute_buy(executor, token_id, price, tick_size, label) -> tuple:
+    """Place a FAK buy and return (shares, cost) or (None, None) on failure."""
+    log.info(f"*** {label}: {price:.4f} — buying {BUY_ORDER_TYPE} ***")
+    resp = executor.place_buy(token_id=token_id, price=price,
+                              usdc_size=AMOUNT_TO_BUY, tick_size=tick_size)
+    if resp and resp.get("success"):
+        shares, cost = _parse_buy_result(resp, price, AMOUNT_TO_BUY)
+        log.info(f"  ✔ {label} bought | shares={shares:.4f} | cost=${cost:.4f}")
+        return shares, cost
+    log.error(f"  ✗ {label} buy failed | resp={resp}")
+    return None, None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN WINDOW LOOP
 # ══════════════════════════════════════════════════════════════════════════════
@@ -277,14 +313,18 @@ def run_window(market: dict, executor: OrderExecutor, state: BotState):
     tick_up    = get_tick_size_rest(executor.client, token_up)
     tick_down  = get_tick_size_rest(executor.client, token_down)
 
-    range_low, range_high = PRICE_RANGE
+    range_low,   range_high   = PRICE_RANGE
+    trigger_low, trigger_high = TRIGGER_RANGE
 
     log.info("=" * 60)
     log.info(f"Window | Market ID: {market.get('id', '')}")
     log.info(f"  UP   token : {token_up}")
     log.info(f"  DOWN token : {token_down}")
     log.info(f"  End time   : {end_time}")
-    log.info(f"  PRICE_RANGE: {range_low:.2f} – {range_high:.2f}")
+    log.info(f"  MODE       : {'Loss Prevention ON' if LOSS_PREVENTION else 'Standard'}")
+    log.info(f"  PRICE_RANGE: {range_low:.2f} – {range_high:.2f}  {'(both sides)' if not LOSS_PREVENTION else '(second side)'}")
+    if LOSS_PREVENTION:
+        log.info(f"  TRIGGER    : {trigger_low:.2f} – {trigger_high:.2f}  (first side)")
     log.info(f"  BUY_AMOUNT : ${AMOUNT_TO_BUY:.2f} per side")
     log.info(f"  BUY_TYPE   : {BUY_ORDER_TYPE}")
     log.info("=" * 60)
@@ -336,8 +376,23 @@ def run_window(market: dict, executor: OrderExecutor, state: BotState):
             combined   = up_price + down_price
             src        = "WSS" if stream.is_connected else "REST"
 
-            up_status   = "✔ bought" if state.bought_up   else ("IN RANGE" if range_low <= up_price   <= range_high else "waiting")
-            down_status = "✔ bought" if state.bought_down else ("IN RANGE" if range_low <= down_price <= range_high else "waiting")
+            # ── Status labels for tick display ─────────────────────────────
+            def _status(bought, price, is_trigger_side_active):
+                if bought:
+                    return "✔ bought"
+                if LOSS_PREVENTION and is_trigger_side_active:
+                    # After first-side trigger buy, opposite side waits for PRICE_RANGE
+                    return "IN RANGE" if range_low <= price <= range_high else "waiting→PR"
+                if LOSS_PREVENTION and not state.trigger_side:
+                    # No side bought yet — both watching TRIGGER_RANGE
+                    return "IN TRIGGER" if trigger_low <= price <= trigger_high else "waiting→TR"
+                # Standard mode
+                return "IN RANGE" if range_low <= price <= range_high else "waiting"
+
+            up_in_trigger_active   = state.trigger_side == "DOWN"  # UP is the "opposite" side
+            down_in_trigger_active = state.trigger_side == "UP"    # DOWN is the "opposite" side
+            up_status   = _status(state.bought_up,   up_price,   up_in_trigger_active)
+            down_status = _status(state.bought_down, down_price, down_in_trigger_active)
 
             log.info(
                 f"[{mins:02d}:{secs:02d}]  "
@@ -346,33 +401,82 @@ def run_window(market: dict, executor: OrderExecutor, state: BotState):
                 f"combined={combined:.4f}  {src}"
             )
 
-            if not state.bought_up and range_low <= up_price <= range_high:
-                log.info(f"*** UP in range: {up_price:.4f} — buying {BUY_ORDER_TYPE} ***")
-                resp = executor.place_buy(token_id=token_up, price=up_price,
-                                          usdc_size=AMOUNT_TO_BUY, tick_size=tick_up)
-                if resp and resp.get("success"):
-                    shares, cost = _parse_buy_result(resp, up_price, AMOUNT_TO_BUY)
-                    state.bought_up = True
-                    state.up_shares = shares
-                    state.up_cost   = cost
-                    state.up_price  = up_price
-                    log.info(f"  ✔ UP bought | shares={shares:.4f} | cost=${cost:.4f}")
-                else:
-                    log.error(f"  ✗ UP buy failed | resp={resp}")
+            # ══════════════════════════════════════════════════════════════
+            #  BUY LOGIC
+            # ══════════════════════════════════════════════════════════════
 
-            if not state.bought_down and range_low <= down_price <= range_high:
-                log.info(f"*** DOWN in range: {down_price:.4f} — buying {BUY_ORDER_TYPE} ***")
-                resp = executor.place_buy(token_id=token_down, price=down_price,
-                                          usdc_size=AMOUNT_TO_BUY, tick_size=tick_down)
-                if resp and resp.get("success"):
-                    shares, cost = _parse_buy_result(resp, down_price, AMOUNT_TO_BUY)
-                    state.bought_down = True
-                    state.down_shares = shares
-                    state.down_cost   = cost
-                    state.down_price  = down_price
-                    log.info(f"  ✔ DOWN bought | shares={shares:.4f} | cost=${cost:.4f}")
-                else:
-                    log.error(f"  ✗ DOWN buy failed | resp={resp}")
+            if not LOSS_PREVENTION:
+                # ── Standard mode: both sides use PRICE_RANGE ─────────────
+                if not state.bought_up and range_low <= up_price <= range_high:
+                    shares, cost = _execute_buy(executor, token_up, up_price, tick_up, "UP")
+                    if shares:
+                        state.bought_up = True
+                        state.up_shares = shares
+                        state.up_cost   = cost
+                        state.up_price  = up_price
+
+                if not state.bought_down and range_low <= down_price <= range_high:
+                    shares, cost = _execute_buy(executor, token_down, down_price, tick_down, "DOWN")
+                    if shares:
+                        state.bought_down = True
+                        state.down_shares = shares
+                        state.down_cost   = cost
+                        state.down_price  = down_price
+
+            else:
+                # ── Loss prevention mode ───────────────────────────────────
+                #
+                # Phase 1 — No side bought yet:
+                #   Watch both UP and DOWN for TRIGGER_RANGE.
+                #   Buy whichever hits it first.
+                #
+                # Phase 2 — One side bought via trigger:
+                #   Watch ONLY the opposite side for PRICE_RANGE.
+                #   Do NOT buy the already-bought side again.
+
+                if not state.bought_up and not state.bought_down:
+                    # Phase 1: neither side bought — watch TRIGGER_RANGE on both
+                    if trigger_low <= up_price <= trigger_high:
+                        log.info(f"  [LP] UP hit TRIGGER_RANGE {trigger_low:.2f}–{trigger_high:.2f}")
+                        shares, cost = _execute_buy(executor, token_up, up_price, tick_up, "UP [trigger]")
+                        if shares:
+                            state.bought_up    = True
+                            state.up_shares    = shares
+                            state.up_cost      = cost
+                            state.up_price     = up_price
+                            state.trigger_side = "UP"
+                            log.info(f"  [LP] Now waiting for DOWN to enter PRICE_RANGE {range_low:.2f}–{range_high:.2f}")
+
+                    elif trigger_low <= down_price <= trigger_high:
+                        log.info(f"  [LP] DOWN hit TRIGGER_RANGE {trigger_low:.2f}–{trigger_high:.2f}")
+                        shares, cost = _execute_buy(executor, token_down, down_price, tick_down, "DOWN [trigger]")
+                        if shares:
+                            state.bought_down  = True
+                            state.down_shares  = shares
+                            state.down_cost    = cost
+                            state.down_price   = down_price
+                            state.trigger_side = "DOWN"
+                            log.info(f"  [LP] Now waiting for UP to enter PRICE_RANGE {range_low:.2f}–{range_high:.2f}")
+
+                elif state.trigger_side == "UP" and not state.bought_down:
+                    # Phase 2: UP was bought via trigger — wait for DOWN in PRICE_RANGE
+                    if range_low <= down_price <= range_high:
+                        shares, cost = _execute_buy(executor, token_down, down_price, tick_down, "DOWN [LP second]")
+                        if shares:
+                            state.bought_down = True
+                            state.down_shares = shares
+                            state.down_cost   = cost
+                            state.down_price  = down_price
+
+                elif state.trigger_side == "DOWN" and not state.bought_up:
+                    # Phase 2: DOWN was bought via trigger — wait for UP in PRICE_RANGE
+                    if range_low <= up_price <= range_high:
+                        shares, cost = _execute_buy(executor, token_up, up_price, tick_up, "UP [LP second]")
+                        if shares:
+                            state.bought_up = True
+                            state.up_shares = shares
+                            state.up_cost   = cost
+                            state.up_price  = up_price
 
             if state.bought_up or state.bought_down:
                 log.info(state.summary())
@@ -409,13 +513,19 @@ def run(interval: Optional[str] = None):
                     break
                 print("  Please enter 5 or 15")
 
-    range_low, range_high = PRICE_RANGE
+    range_low, range_high     = PRICE_RANGE
+    trigger_low, trigger_high = TRIGGER_RANGE
+
     log.info("=" * 60)
     log.info("XRP YES+NO Strategy starting")
-    log.info(f"  Market     : XRP {interval.upper()}")
-    log.info(f"  Range      : {range_low:.2f} – {range_high:.2f}")
-    log.info(f"  Buy amount : ${AMOUNT_TO_BUY:.2f} per side")
-    log.info(f"  Buy type   : {BUY_ORDER_TYPE}")
+    log.info(f"  Market          : XRP {interval.upper()}")
+    log.info(f"  Mode            : {'Loss Prevention ON' if LOSS_PREVENTION else 'Standard'}")
+    log.info(f"  PRICE_RANGE     : {range_low:.2f} – {range_high:.2f}")
+    if LOSS_PREVENTION:
+        log.info(f"  TRIGGER_RANGE   : {trigger_low:.2f} – {trigger_high:.2f}  (first side entry)")
+        log.info(f"  Flow            : buy first side @ TRIGGER → buy second side @ PRICE_RANGE")
+    log.info(f"  Buy amount      : ${AMOUNT_TO_BUY:.2f} per side")
+    log.info(f"  Buy type        : {BUY_ORDER_TYPE}")
     log.info("=" * 60)
 
     client   = build_clob_client()
