@@ -1,9 +1,9 @@
 {
   "traders": [
     {
-      "address": "0xd84c2b6d65dc596f49c7b6aadd6d74ca91e407b9",
-      "nickname": "BoneReader",
-      "enabled": false,
+      "address": "0x47093b4ea23985fedebf5ac461e323b90f40f6c2",
+      "nickname": "what-would-hayek-do",
+      "enabled": true,
       "copy_buys": true,
       "copy_sells": true,
       "reverse_trading": false,
@@ -23,7 +23,7 @@
     {
       "address": "0xdf4cafe4564fe284bbadb56f1b8fbe8c80f4cb89",
       "nickname": "6yyss",
-      "enabled": true,
+      "enabled": false,
       "copy_buys": true,
       "copy_sells": true,
       "reverse_trading": false,

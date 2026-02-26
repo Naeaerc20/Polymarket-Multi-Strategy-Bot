@@ -84,7 +84,7 @@ STRATEGIES = {
         "needs_markets" : False,
         "needs_interval": False,
         "paths": {
-            "all": ROOT / "strategies" / "Copy-Trade" / "bot.py",
+            "all": ROOT / "strategies" / "CopyTrading" / "bot.py",
         },
     },
     "rsivwap": {
