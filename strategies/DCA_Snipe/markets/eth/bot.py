@@ -130,8 +130,9 @@ POLL_INTERVAL    = _float_env("ETH_POLL_INTERVAL",  0.5)
 BET_STEP         = _optional_float("ETH_BET_STEP")
 STOP_LOSS        = _optional_float("ETH_STOP_LOSS")
 STOP_LOSS_OFFSET = _optional_float("ETH_STOP_LOSS_OFFSET")
+USE_STOP_LOSS    = os.getenv("ETH_USE_STOP_LOSS", "true").strip().lower() not in ("false", "0", "no")
 
-SL_BREAKEVEN_MODE = (STOP_LOSS is None) and (STOP_LOSS_OFFSET is None)
+SL_BREAKEVEN_MODE = USE_STOP_LOSS and (STOP_LOSS is None) and (STOP_LOSS_OFFSET is None)
 
 BUY_ORDER_TYPE  = (os.getenv("BUY_ORDER_TYPE")  or "FAK").upper()
 SELL_ORDER_TYPE = (os.getenv("SELL_ORDER_TYPE") or "GTC").upper()
@@ -452,21 +453,27 @@ class BotState:
         self.total_spent  += usdc_paid
         self.avg_price     = self.total_spent / self.total_shares if self.total_shares else bet_price
 
-        if STOP_LOSS_OFFSET is not None:
-            self.effective_stop_loss = round(self.avg_price - STOP_LOSS_OFFSET, 4)
-        elif STOP_LOSS is not None:
-            self.effective_stop_loss = STOP_LOSS
+        if USE_STOP_LOSS:
+            if STOP_LOSS_OFFSET is not None:
+                self.effective_stop_loss = round(self.avg_price - STOP_LOSS_OFFSET, 4)
+            elif STOP_LOSS is not None:
+                self.effective_stop_loss = STOP_LOSS
+            else:
+                # Break-even: SL = avg_price - 1 tick (prevents self-trigger)
+                self.effective_stop_loss = round(self.avg_price - 0.01, 4)
         else:
-            # Break-even: SL = avg_price - 1 tick (prevents self-trigger)
-            self.effective_stop_loss = round(self.avg_price - 0.01, 4)
+            self.effective_stop_loss = None
 
         self.last_bet_price = bet_price
         self.bets_count    += 1
         self.in_position    = True
 
     def summary(self) -> str:
-        sl_mode = "(dynamic)" if STOP_LOSS_OFFSET else "(break-even)" if SL_BREAKEVEN_MODE else "(fixed)"
-        sl_val  = f"{self.effective_stop_loss:.4f}{sl_mode}" if self.effective_stop_loss else "none"
+        if not USE_STOP_LOSS:
+            sl_val = "DISABLED"
+        else:
+            sl_mode = "(dynamic)" if STOP_LOSS_OFFSET else "(break-even)" if SL_BREAKEVEN_MODE else "(fixed)"
+            sl_val  = f"{self.effective_stop_loss:.4f}{sl_mode}" if self.effective_stop_loss else "none"
         mode    = f"DCA STEP={BET_STEP}" if BET_STEP else "Single bet"
         return (
             f"  Side={self.side}  Bets={self.bets_count}  Shares={self.total_shares:.4f}"
@@ -516,7 +523,7 @@ def place_brackets(executor: OrderExecutor, state: BotState, tick_size: float,
         log.warning("  [bracket] Shares too small to place SELL orders — skipping")
         return
 
-    sl_disp = f"{state.effective_stop_loss:.4f}" if state.effective_stop_loss else "none"
+    sl_disp = "DISABLED" if not USE_STOP_LOSS else (f"{state.effective_stop_loss:.4f}" if state.effective_stop_loss else "none")
     sl_mode = " (break-even)" if SL_BREAKEVEN_MODE else ""
     log.info(f"  Placing brackets: TP={TAKE_PROFIT}  SL={sl_disp}{sl_mode}  shares={shares_to_sell:.4f}")
 
@@ -550,7 +557,8 @@ def run_window(market: dict, executor: OrderExecutor, state: BotState, interval:
     client     = executor.client
 
     sl_cfg = (
-        f"SL_OFFSET={STOP_LOSS_OFFSET}(dynamic)" if STOP_LOSS_OFFSET
+        "SL=DISABLED" if not USE_STOP_LOSS
+        else f"SL_OFFSET={STOP_LOSS_OFFSET}(dynamic)" if STOP_LOSS_OFFSET
         else "SL=avg_price(break-even)" if SL_BREAKEVEN_MODE
         else f"SL={STOP_LOSS}(fixed)"
     )
@@ -687,7 +695,7 @@ def run_window(market: dict, executor: OrderExecutor, state: BotState, interval:
                 log.info(
                     f"[{time_label}]  {state.side}={cp:.4f}"
                     f"  AvgP={state.avg_price:.4f}"
-                    f"  SL={state.effective_stop_loss:.4f}"
+                    f"  SL={'OFF' if not USE_STOP_LOSS else f'{state.effective_stop_loss:.4f}'}"
                     f"  TP={TAKE_PROFIT}"
                     f"  Shares={state.total_shares:.4f}"
                     f"  {src}"
@@ -714,7 +722,7 @@ def run_window(market: dict, executor: OrderExecutor, state: BotState, interval:
                         break
 
                     # SL filled externally?
-                    if state.sl_order_id and not is_order_open(client, state.sl_order_id):
+                    if USE_STOP_LOSS and state.sl_order_id and not is_order_open(client, state.sl_order_id):
                         pnl = (state.effective_stop_loss - state.avg_price) * state.total_shares
                         log.info(
                             f"*** STOP LOSS FILLED (detected via order status) ***\n"
@@ -745,7 +753,7 @@ def run_window(market: dict, executor: OrderExecutor, state: BotState, interval:
                     continue
 
                 # ── Manual fallback: SL ────────────────────────────────────────
-                if (
+                if USE_STOP_LOSS and (
                     not state.sl_order_id
                     and state.effective_stop_loss is not None
                     and cp <= state.effective_stop_loss
@@ -839,7 +847,8 @@ def run(interval: Optional[str] = None):
                 if c == "24h":   interval = "24h";   break
 
     sl_cfg = (
-        f"SL_OFFSET={STOP_LOSS_OFFSET}(dynamic)" if STOP_LOSS_OFFSET
+        "SL=DISABLED" if not USE_STOP_LOSS
+        else f"SL_OFFSET={STOP_LOSS_OFFSET}(dynamic)" if STOP_LOSS_OFFSET
         else "SL=avg_price(break-even)" if SL_BREAKEVEN_MODE
         else f"SL={STOP_LOSS}(fixed)"
     )

@@ -1,39 +1,97 @@
 """
-strategies/DCA_Snipe/markets/sol/bot.py
----------------------------------------
-SOL Up/Down Bot for Polymarket — DCA Snipe strategy.
+strategies/RSI_VWAP_Signal/markets/sol/bot.py  ──  v2 Adaptive Interval
+──────────────────────────────────────────────────────────────────────
+SOL RSI+VWAP v2 — Binance RSI+VWAP con intervalo adaptativo.
 
-MARKET DISCOVERY
-  5m/15m: slug = "sol-updown-{interval}-{unix_ts}"
-          GET gamma-api.polymarket.com/markets?slug=...
+CÓMO FUNCIONA (paso a paso)
+──────────────────────────────────────────────────────────────────────
+1. INTERVALO ADAPTATIVO
+   Antes de cada ventana de mercado, se calcula el tiempo restante.
+   El RSI se calcula sobre velas de 1m con un periodo = minutos restantes
+   (cap entre 3 y 30). Ejemplo: 15m restantes → RSI(15) en velas 1m.
 
-  1h:     event slug = "solana-up-or-down-{month}-{day}-{hour}{ampm}-et"
-          e.g. "solana-up-or-down-february-25-12pm-et"
-          GET gamma-api.polymarket.com/events?slug=...  → extract active child market
-          Tries current hour ±1 to handle clock drift.
+2. PRE-CARGA (por ventana)
+   Descarga las últimas rsi_period+10 velas de 1m de Binance REST.
+   El RSI está listo inmediatamente sin warmup.
 
-POSITION VERIFICATION  (Not Enough Allowance fix)
-  Before every SELL, queries:
-    GET data-api.polymarket.com/positions
-        ?user={FUNDER_ADDRESS}&sizeThreshold=0.01&market={conditionId}&limit=200
-  Returns real shares held. Falls back to CLOB /balance-allowance on failure.
-  Using real shares prevents selling more than we actually own.
+3. MOTOR DE SEÑAL (background thread)
+   • Binance WebSocket (klines SOLUSDT 1m):
+     calcula RSI (EMA de Wilder) + VWAP diario en cada vela cerrada.
+   La señal es exclusivamente de Binance — sin ChainLink.
 
-AUTOSET_UP_TP_SL_ORDERS
-  true  (default) → place GTC TP+SL brackets immediately after each BUY
-  false           → no bracket orders; TP/SL monitored manually via price ticks
-                    Use this when approve_ctf.py hasn't been run yet.
+4. ZONA TEMPORAL ("prime window")
+   Al inicio de cada ventana de mercado, el RiskManager clasifica el tiempo:
+     PRIME [0 – EARLY_BET_WINDOW_SECS]: mejor precio por share → entrada preferida.
+     OK    [PRIME – 50% de la ventana ]: entrada válida si no hubo señal en PRIME.
+     LATE  [>50% de la ventana]         : NO nuevas entradas.
 
-STOP LOSS MODES
-  Fixed:      SOL_STOP_LOSS=0.55   SOL_STOP_LOSS_OFFSET=null
-  Dynamic:    SOL_STOP_LOSS=null   SOL_STOP_LOSS_OFFSET=0.02  (SL = avg - 0.02)
-  Break-even: SOL_STOP_LOSS=null   SOL_STOP_LOSS_OFFSET=null  (SL = avg - 1 tick)
+5. SEÑAL
+   En cada tick se llama a MultiSourceEngine.get_signal(token_up, token_down):
+     • Binance RSI+VWAP: dirección + confianza.
+     • Polymarket CLOB book: best_ask de cada token (solo para precio de entrada).
+   La señal es accionable cuando RSI cruza el umbral bull/bear y precio > VWAP.
 
-.env variables
-  SOL_ENTRY_PRICE, SOL_AMOUNT_PER_BET, SOL_TAKE_PROFIT
-  SOL_STOP_LOSS, SOL_STOP_LOSS_OFFSET, SOL_BET_STEP, SOL_POLL_INTERVAL
-  AUTOSET_UP_TP_SL_ORDERS=true|false
-  BUY_ORDER_TYPE, SELL_ORDER_TYPE, GTC_TIMEOUT_SECONDS, FOK_GTC_FALLBACK
+6. ENTRADA  (precio óptimo)
+   Cuando hay señal válida + zona OK/PRIME:
+     a. Consulta el best_ask del CLOB para el token elegido.
+     b. Usa ese precio en vez del midpoint para entrar al mejor precio disponible.
+     c. Coloca BUY (FAK por defecto).
+     d. Registra la posición en el RiskManager.
+
+6. GESTIÓN DE RIESGO POST-ENTRADA
+   El RiskManager evalúa en cada tick:
+     • STOP-LOSS: si el precio cae ≥ RISK_STOP_LOSS_PCT bajo el precio de entrada
+       → venta inmediata (FAK).
+     • HEDGE: si el precio cae ≥ RISK_HEDGE_TRIGGER_PCT (mayor pérdida)
+       → compra del lado contrario con el mismo amount para cubrir riesgo.
+     • TP / SL bracket GTC: se colocan opcionalmente (AUTOSET_UP_TP_SL_ORDERS).
+
+7. GESTIÓN DE VENTANAS
+   Cada ventana (5m / 15m / 1h) es independiente.
+   Máximo 1 entrada por dirección por ventana.
+   Al cerrar la ventana, se cancelan órdenes abiertas y se espera la siguiente.
+
+INTERVALOS SOPORTADOS
+  5m  → slug: sol-updown-5m-{unix_ts}
+  15m → slug: sol-updown-15m-{unix_ts}
+  1h  → slug de evento ET: solana-up-or-down-{mes}-{dia}-{hora}{am/pm}-et
+
+VARIABLES .env (SOL-específicas)
+──────────────────────────────────────────────────────────────────────
+  SOL_RSI_VWAP_PRICE_RANGE    Rango de precio del token para entrar (ej. "0.30-0.55")
+  SOL_RSI_VWAP_AMOUNT         USDC a gastar por BET (default 1.0)
+  SOL_RSI_VWAP_TAKE_PROFIT    Precio TP para bracket GTC (ej. 0.80)
+  SOL_RSI_VWAP_STOP_LOSS      Precio SL fijo para bracket GTC (ej. 0.40)
+  SOL_RSI_VWAP_POLL_INTERVAL  Segundos entre ticks (default 0.5)
+
+VARIABLES .env (compartidas RSI_VWAP v2)
+  RSI_PERIOD, RSI_OVERBOUGHT, RSI_OVERSOLD
+  RSI_BULL_THRESHOLD, RSI_BEAR_THRESHOLD
+  MIN_SIGNAL_CONFIDENCE
+  EARLY_BET_WINDOW_SECS        Zona PRIME en segundos (default 90)
+  EARLY_BET_ONLY               true = solo entrar en PRIME (default false)
+  RISK_STOP_LOSS_ENABLED       true | false (default true)
+  RISK_STOP_LOSS_PCT           % caída para SL dinámico (default 0.04)
+  RISK_HEDGE_ENABLED           true | false (default false)
+  RISK_HEDGE_TRIGGER_PCT       % caída para hedge (default 0.06)
+  RISK_TIME_DECAY_MAX_PCT      % ventana máx. para nuevas entradas (default 0.50)
+  AUTOSET_UP_TP_SL_ORDERS      true = colocar bracket GTC después del BUY
+  SOL_RSI_VWAP_DRY_RUN         true = simular órdenes sin fondos reales (default false)
+
+DRY-RUN
+──────────────────────────────────────────────────────────────────────
+Activar con:
+  SOL_RSI_VWAP_DRY_RUN=true  en .env
+  python main.py --strategy rsivwap --operate sol --interval 5m --dry-run
+  python strategies/RSI_VWAP_Signal/markets/sol/bot.py  (pregunta al inicio)
+
+En modo dry-run:
+  • Las señales, consenso y zonas PRIME/OK/LATE se calculan igual.
+  • El RiskManager evalúa stop-loss y hedge igual.
+  • Ninguna orden real se envía al CLOB.
+  • Cada acción se registra con el prefijo [DRY RUN].
+  • El estado del bot se actualiza como si las órdenes hubieran sido ejecutadas,
+    lo que permite simular el flujo completo de una sesión.
 """
 
 import os
@@ -48,87 +106,176 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-# ── Path resolution ────────────────────────────────────────────────────────────
-def _find_root(marker: str) -> Path:
+
+# ── Path resolution ───────────────────────────────────────────────────────────
+def _find_dir_with(marker: str) -> Path:
     p = Path(__file__).resolve().parent
     for _ in range(12):
         if (p / marker).exists():
             return p
         p = p.parent
-    raise FileNotFoundError(f"Project root not found (marker: {marker})")
+    raise FileNotFoundError(
+        f"No se encontró '{marker}' en ningún directorio padre de {__file__}"
+    )
 
-_ROOT = _find_root("order_executor.py")
+_ROOT            = _find_dir_with("order_executor.py")
+_SIGNAL_ENGINE_DIR = _find_dir_with("signal_engine.py")
+
 load_dotenv(_ROOT / ".env")
-sys.path.insert(0, str(_ROOT))
 
-from order_executor import OrderExecutor
-from market_stream  import MarketStream
+for _p in [str(_ROOT), str(_SIGNAL_ENGINE_DIR)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from order_executor     import OrderExecutor
+from market_stream      import MarketStream
+from signal_engine      import preload_history
+from signal_engine_v2   import MultiSourceEngine, MultiSourceSignal
+from risk_manager       import RiskManager, RiskEvent, WindowZone
 
 logging.basicConfig(
     level   = logging.INFO,
     format  = "[%(asctime)s][%(levelname)s] - %(message)s",
     datefmt = "%H:%M:%S",
 )
-log = logging.getLogger("SOL-DCA")
+log = logging.getLogger("SOL-RSI-VWAP-v2")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS DE CONFIGURACIÓN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_range(raw: str):
+    parts = [p.strip() for p in raw.split("-")]
+    return float(parts[0]), float(parts[1])
+
+def _float(key, default):
+    v = os.getenv(key, "").strip().lower()
+    return float(v) if v not in ("", "null", "none") else default
+
+def _int(key, default):
+    v = os.getenv(key, "").strip().lower()
+    return int(v) if v not in ("", "null", "none") else default
+
+def _bool(key, default):
+    v = os.getenv(key, "").strip().lower()
+    if v in ("", "null", "none"): return default
+    return v not in ("false", "0", "no", "off")
+
+def _optional_float(key) -> Optional[float]:
+    v = os.getenv(key, "").strip().lower()
+    return None if v in ("", "null", "none") else float(v)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _float_env(key: str, default: float) -> float:
-    v = os.getenv(key, "").strip().lower()
-    try:
-        return float(v) if v not in ("", "null", "none") else default
-    except ValueError:
-        return default
+# ── SOL-específico ────────────────────────────────────────────────────────────
+PRICE_RANGE    = _parse_range(os.getenv("SOL_RSI_VWAP_PRICE_RANGE", "0.30-0.55"))
+AMOUNT_TO_BUY  = _float("SOL_RSI_VWAP_AMOUNT",         1.0)
+TAKE_PROFIT    = _optional_float("SOL_RSI_VWAP_TAKE_PROFIT")    # ej. 0.80
+BRACKET_SL     = _optional_float("SOL_RSI_VWAP_STOP_LOSS")      # bracket GTC fijo
+POLL_INTERVAL  = _float("SOL_RSI_VWAP_POLL_INTERVAL",  0.5)
 
-def _optional_float(key: str) -> Optional[float]:
-    v = os.getenv(key, "").strip().lower()
-    return None if v in ("", "null", "none") else (float(v) if v else None)
+# ── RSI + VWAP (Binance) ──────────────────────────────────────────────────────
+RSI_PERIOD          = _int(  "RSI_PERIOD",           14)
+RSI_OVERBOUGHT      = _float("RSI_OVERBOUGHT",       70.0)
+RSI_OVERSOLD        = _float("RSI_OVERSOLD",         30.0)
+RSI_BULL_THRESHOLD  = _float("RSI_BULL_THRESHOLD",   52.0)
+RSI_BEAR_THRESHOLD  = _float("RSI_BEAR_THRESHOLD",   48.0)
+MIN_CONFIDENCE      = _float("MIN_SIGNAL_CONFIDENCE", 0.55)
+# CANDLE_INTERVAL es solo referencia; el bot usa siempre "1m" con periodo adaptativo
 
-def _bool_env(key: str, default: bool) -> bool:
-    v = os.getenv(key, "").strip().lower()
-    if v in ("", "null", "none"):
-        return default
-    return v not in ("false", "0", "no", "off")
+# ── Early-window BET ──────────────────────────────────────────────────────────
+EARLY_BET_SECS  = _float("EARLY_BET_WINDOW_SECS",    90.0)
+EARLY_BET_ONLY  = _bool( "EARLY_BET_ONLY",           False)
 
-ENTRY_PRICE      = _float_env("SOL_ENTRY_PRICE",    0.60)
-AMOUNT_PER_BET   = _float_env("SOL_AMOUNT_PER_BET", 5.0)
-TAKE_PROFIT      = _float_env("SOL_TAKE_PROFIT",    0.85)
-POLL_INTERVAL    = _float_env("SOL_POLL_INTERVAL",  0.1)
-BET_STEP         = _optional_float("SOL_BET_STEP")
-STOP_LOSS        = _optional_float("SOL_STOP_LOSS")
-STOP_LOSS_OFFSET = _optional_float("SOL_STOP_LOSS_OFFSET")
+# ── Multi-entry DCA ───────────────────────────────────────────────────────────
+MAX_BETS_PER_SIDE = _int(  "MAX_BETS_PER_SIDE",   5)      # máx entradas por dirección
+BET_COOLDOWN_SECS = _float("BET_COOLDOWN_SECS",   90.0)   # segundos mínimos entre BETs
 
-SL_BREAKEVEN_MODE = (STOP_LOSS is None) and (STOP_LOSS_OFFSET is None)
+# ── Risk management ───────────────────────────────────────────────────────────
+RISK_SL_ENABLED = _bool( "RISK_STOP_LOSS_ENABLED",   True)
+RISK_SL_PCT     = _float("RISK_STOP_LOSS_PCT",        0.04)
+RISK_HEDGE_EN   = _bool( "RISK_HEDGE_ENABLED",        False)
+RISK_HEDGE_PCT  = _float("RISK_HEDGE_TRIGGER_PCT",    0.06)
+RISK_TIME_PCT   = _float("RISK_TIME_DECAY_MAX_PCT",   0.50)
 
-# Master switch: set false to skip bracket orders entirely (manual TP/SL only)
-AUTOSET_BRACKETS = _bool_env("AUTOSET_UP_TP_SL_ORDERS", True)
-
-BUY_ORDER_TYPE  = (os.getenv("BUY_ORDER_TYPE")  or "FAK").upper()
-SELL_ORDER_TYPE = (os.getenv("SELL_ORDER_TYPE") or "FAK").upper()
-
-_gtc_raw    = os.getenv("GTC_TIMEOUT_SECONDS", "null").strip().lower()
-GTC_TIMEOUT : Optional[int] = None if _gtc_raw == "null" else int(_gtc_raw)
-
-WSS_READY_TIMEOUT = _float_env("WSS_READY_TIMEOUT", 10.0)
+# ── Orden / infra ─────────────────────────────────────────────────────────────
+BUY_ORDER_TYPE    = (os.getenv("BUY_ORDER_TYPE") or "FAK").upper()
+AUTOSET_BRACKETS  = _bool("AUTOSET_UP_TP_SL_ORDERS", True)
+WSS_READY_TIMEOUT = _float("WSS_READY_TIMEOUT",       10.0)
+DRY_RUN           = _bool("SOL_RSI_VWAP_DRY_RUN",    False)
 
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API  = "https://data-api.polymarket.com"
 CHAIN_ID  = 137
 
-SLUG_TEMPLATES = {
-    "5m":  "sol-updown-5m-{ts}",
-    "15m": "sol-updown-15m-{ts}",
-}
 WINDOW_SECONDS = {"5m": 300, "15m": 900, "1h": 3600}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ADAPTIVE INTERVAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_adaptive_interval(time_left_secs: float):
+    """
+    Calcula el intervalo adaptativo basado en el tiempo restante.
+
+    Siempre usa velas de 1m. El periodo de RSI = minutos restantes,
+    capado entre 3 y 30 para estabilidad numérica.
+
+    Ejemplo: 15m restantes → ("1m", 15) → RSI mide los últimos 15 minutos.
+             9m restantes  → ("1m", 9)
+             60m restantes → ("1m", 30) [cap]
+    """
+    mins   = int(time_left_secs / 60)
+    period = max(3, min(30, mins))
+    return "1m", period
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CLOB CLIENT
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DRY-RUN HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _dry_buy(direction: str, token_id: str, price: float, usdc: float) -> dict:
+    """Simula un BUY: loguea la orden y devuelve una respuesta de éxito falsa."""
+    shares = round(usdc / price, 4)
+    log.info(
+        f"  [DRY RUN] BUY {direction} — "
+        f"token={token_id[:16]}...  price={price:.4f}  "
+        f"usdc=${usdc:.2f}  ~shares={shares:.4f}"
+    )
+    return {
+        "success":      True,
+        "dry_run":      True,
+        "takingAmount": str(shares),
+        "makingAmount": str(usdc),
+    }
+
+def _dry_sell(action: str, token_id: str, shares: float, price: float) -> dict:
+    """Simula un SELL: loguea la acción y devuelve respuesta de éxito falsa."""
+    log.info(
+        f"  [DRY RUN] SELL {action} — "
+        f"token={token_id[:16]}...  shares={shares:.4f}  price={price:.4f}"
+    )
+    return {"success": True, "dry_run": True}
+
+def _dry_bracket(direction: str, token_id: str, shares: float,
+                 tp: Optional[float], sl: Optional[float]) -> dict:
+    """Simula colocación de brackets TP+SL."""
+    log.info(
+        f"  [DRY RUN] BRACKETS {direction} — "
+        f"shares={shares:.4f}  TP={tp}  SL={sl}"
+    )
+    return {"tp_order_id": "DRY_TP", "sl_order_id": "DRY_SL" if sl else None}
+
 
 def build_clob_client():
     from py_clob_client.client     import ClobClient
@@ -142,7 +289,7 @@ def build_clob_client():
     pas  = os.getenv("POLY_API_PASSPHRASE", "")
 
     if not all([pk, fund, key, sec, pas]):
-        log.error("Missing credentials — run setup.py first")
+        log.error("Credenciales incompletas — ejecuta setup.py primero")
         sys.exit(1)
 
     creds  = ApiCreds(api_key=key, api_secret=sec, api_passphrase=pas)
@@ -155,20 +302,13 @@ def build_clob_client():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MARKET DISCOVERY
+#  MARKET DISCOVERY  (5m / 15m / 1h)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _et_offset(month: int) -> int:
-    """Return UTC→ET offset in hours. EST=-5 (Nov–Mar), EDT=-4 (Mar–Nov)."""
     return -4 if 3 <= month <= 11 else -5
 
-
 def _build_1h_event_slug(dt_utc: datetime) -> str:
-    """
-    Convert a UTC datetime to the Polymarket 1h event slug.
-
-    2025-02-25 17:00 UTC  →  "solana-up-or-down-february-25-12pm-et"
-    """
     dt_et = (dt_utc + timedelta(hours=_et_offset(dt_utc.month))).replace(
         minute=0, second=0, microsecond=0
     )
@@ -180,75 +320,63 @@ def _build_1h_event_slug(dt_utc: datetime) -> str:
     else:            h_str = f"{hour - 12}pm"
     return f"solana-up-or-down-{month_str}-{dt_et.day}-{h_str}-et"
 
-
 def _gamma_get(endpoint: str, params: dict) -> Optional[object]:
     try:
         r = requests.get(f"{GAMMA_API}/{endpoint}", params=params, timeout=10)
         r.raise_for_status()
         return r.json()
     except Exception as exc:
-        log.warning(f"Gamma {endpoint}: {exc}")
+        log.warning(f"Gamma API {endpoint}: {exc}")
         return None
 
-
 def _find_market_5m_15m(interval: str) -> Optional[dict]:
-    window = WINDOW_SECONDS[interval]
-    ts     = (int(datetime.now(timezone.utc).timestamp()) // window) * window
+    templates = {"5m": "sol-updown-5m-{ts}", "15m": "sol-updown-15m-{ts}"}
+    window    = WINDOW_SECONDS[interval]
+    ts        = (int(datetime.now(timezone.utc).timestamp()) // window) * window
     for candidate in [ts, ts + window]:
-        slug = SLUG_TEMPLATES[interval].format(ts=candidate)
+        slug = templates[interval].format(ts=candidate)
         data = _gamma_get("markets", {"slug": slug})
         if not data:
             continue
         for m in (data if isinstance(data, list) else [data]):
             if m.get("active") and not m.get("closed"):
-                log.info(f"  Found market slug: {slug}")
+                log.info(f"  Mercado encontrado: {slug}")
                 return m
     return None
 
-
 def _find_market_1h() -> Optional[dict]:
-    """
-    Search for an active 1h SOL market.
-    Tries current hour, +1h, and -1h to handle edge cases.
-    Searches via /events?slug= first, then /markets?event_slug= fallback.
-    """
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     for h_delta in [0, 1, -1]:
         dt_try     = now + timedelta(hours=h_delta)
         event_slug = _build_1h_event_slug(dt_try)
-        log.info(f"  Trying 1h slug: {event_slug}")
+        log.info(f"  Probando slug 1h: {event_slug}")
 
-        # Primary: /events endpoint
         data = _gamma_get("events", {"slug": event_slug})
         if data:
             for event in (data if isinstance(data, list) else [data]):
                 for m in (event.get("markets") or []):
                     if m.get("active") and not m.get("closed"):
-                        log.info(f"  Found via /events: {event_slug}")
+                        log.info(f"  Encontrado via /events: {event_slug}")
                         return m
 
-        # Fallback: /markets?event_slug=
         data2 = _gamma_get("markets", {"event_slug": event_slug})
         if data2:
             for m in (data2 if isinstance(data2, list) else [data2]):
                 if m.get("active") and not m.get("closed"):
-                    log.info(f"  Found via /markets event_slug: {event_slug}")
+                    log.info(f"  Encontrado via /markets event_slug: {event_slug}")
                     return m
-
     return None
 
-
 def wait_for_active_market(interval: str) -> dict:
-    log.info(f"Searching for active SOL {interval.upper()} market ...")
+    log.info(f"Buscando mercado activo SOL {interval.upper()} ...")
     while True:
         m = _find_market_1h() if interval == "1h" else _find_market_5m_15m(interval)
         if m:
-            log.info(f"  Market ID  : {m.get('id', '?')}")
-            log.info(f"  End time   : {m.get('endDate') or m.get('end_date_iso', '?')}")
+            log.info(f"  Market ID : {m.get('id', '?')}")
+            log.info(f"  End time  : {m.get('endDate') or m.get('end_date_iso', '?')}")
             return m
-        log.info("  No active market — retrying in 20s ...")
+        log.info("  Sin mercado activo — reintentando en 20s ...")
         time.sleep(20)
-
 
 def parse_market_tokens(market: dict) -> dict:
     import json as _j
@@ -261,12 +389,8 @@ def parse_market_tokens(market: dict) -> dict:
     result   = {}
     for i, name in enumerate(outcomes):
         key = "UP" if name.lower() in ("up", "yes") else "DOWN"
-        result[key] = {
-            "token_id": tokens[i] if i < len(tokens) else None,
-            "price":    prices[i] if i < len(prices) else 0.5,
-        }
+        result[key] = {"token_id": tokens[i], "price": prices[i]}
     return result
-
 
 def get_market_end_time(market: dict) -> Optional[datetime]:
     for f in ("endDate", "end_date_iso", "closedTime"):
@@ -280,7 +404,6 @@ def get_market_end_time(market: dict) -> Optional[datetime]:
                 pass
     return None
 
-
 def get_tick_size_rest(client, token_id: str) -> float:
     try:
         r = client.get_tick_size(token_id)
@@ -290,32 +413,42 @@ def get_tick_size_rest(client, token_id: str) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  POSITION QUERY  (real shares — not an estimate)
+#  PRICE FEED
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _rest_mid(token_id: str) -> Optional[float]:
+    try:
+        r = requests.get(
+            f"{CLOB_HOST}/midpoint",
+            params={"token_id": token_id}, timeout=5
+        )
+        r.raise_for_status()
+        return float(r.json()["mid"])
+    except Exception:
+        return None
+
+def get_token_price(stream: MarketStream, token_id: str) -> Optional[float]:
+    return stream.get_midpoint(token_id) or _rest_mid(token_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  POSITION QUERY  (shares reales on-chain)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_real_position(token_id: str, condition_id: Optional[str] = None) -> Optional[float]:
-    """
-    Return real on-chain shares for token_id using the Data API.
-
-    Primary:  GET data-api.polymarket.com/positions
-                  ?user=FUNDER&sizeThreshold=0.01&market=conditionId&limit=200
-    Fallback: same endpoint without market filter (scan all positions)
-    Last:     GET clob.polymarket.com/balance-allowance
-    """
     owner = os.getenv("FUNDER_ADDRESS", "")
     if not owner:
         return None
 
-    def _parse_positions(positions: list) -> Optional[float]:
+    def _parse(positions: list) -> Optional[float]:
         for pos in positions:
             if str(pos.get("asset_id", "")) == str(token_id):
                 raw = pos.get("size") or pos.get("balance") or 0
                 return float(
                     Decimal(str(raw)).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
                 )
-        return None   # token not in list → 0 shares on-chain
+        return None
 
-    # ── Primary: filter by conditionId ────────────────────────────────────────
     if condition_id:
         try:
             r = requests.get(
@@ -325,13 +458,12 @@ def get_real_position(token_id: str, condition_id: Optional[str] = None) -> Opti
                 timeout=8,
             )
             r.raise_for_status()
-            result = _parse_positions(r.json() if isinstance(r.json(), list) else [])
+            result = _parse(r.json() if isinstance(r.json(), list) else [])
             if result is not None:
                 return result
         except Exception as exc:
-            log.warning(f"  [pos] Data API (market filter): {exc}")
+            log.warning(f"[pos] Data API (filtro): {exc}")
 
-    # ── Fallback: scan all positions ──────────────────────────────────────────
     try:
         r = requests.get(
             f"{DATA_API}/positions",
@@ -339,15 +471,11 @@ def get_real_position(token_id: str, condition_id: Optional[str] = None) -> Opti
             timeout=8,
         )
         r.raise_for_status()
-        result = _parse_positions(r.json() if isinstance(r.json(), list) else [])
-        if result is not None:
-            return result
-        log.info("  [pos] Token not found in all-positions scan — 0 shares")
-        return 0.0
+        result = _parse(r.json() if isinstance(r.json(), list) else [])
+        return result if result is not None else 0.0
     except Exception as exc:
-        log.warning(f"  [pos] Data API (all positions): {exc}")
+        log.warning(f"[pos] Data API (global): {exc}")
 
-    # ── Last resort: CLOB balance-allowance ───────────────────────────────────
     try:
         r = requests.get(
             f"{CLOB_HOST}/balance-allowance",
@@ -359,80 +487,11 @@ def get_real_position(token_id: str, condition_id: Optional[str] = None) -> Opti
         bal = float(r.json().get("balance", 0) or 0)
         return float(Decimal(str(bal)).quantize(Decimal("0.0001"), rounding=ROUND_DOWN))
     except Exception as exc:
-        log.warning(f"  [pos] CLOB balance-allowance: {exc}")
+        log.warning(f"[pos] CLOB balance-allowance: {exc}")
     return None
 
 
-def check_ctf_allowance(token_id: str) -> bool:
-    """
-    Verify CTF Exchange has allowance to move tokens.
-    Returns True=ok, False=need to run approve_ctf.py.
-    """
-    owner = os.getenv("FUNDER_ADDRESS", "")
-    try:
-        r = requests.get(
-            f"{CLOB_HOST}/balance-allowance",
-            params={"asset_type": "CONDITIONAL_TOKEN",
-                    "token_id": token_id, "owner": owner},
-            timeout=5,
-        )
-        r.raise_for_status()
-        alw = float(r.json().get("allowance", 0) or 0)
-        log.info(f"  [allowance] CTF Exchange allowance={alw:.4f}")
-        if alw == 0:
-            log.error(
-                "CTF Exchange allowance=0 — SELL orders will fail. "
-                "Fix: python approve_ctf.py  (run once per wallet)"
-            )
-            return False
-        return True
-    except Exception as exc:
-        log.warning(f"  [allowance] Check failed: {exc} — assuming ok")
-        return True
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ORDER STATUS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def is_order_open(client, order_id: str) -> bool:
-    try:
-        resp   = client.get_order(order_id)
-        status = (resp or {}).get("status", "").upper()
-        return status in ("OPEN", "LIVE", "UNMATCHED", "PENDING")
-    except Exception:
-        return False
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  PRICE FEED
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _rest_mid(token_id: str) -> Optional[float]:
-    try:
-        r = requests.get(f"{CLOB_HOST}/midpoint",
-                         params={"token_id": token_id}, timeout=5)
-        r.raise_for_status()
-        return float(r.json()["mid"])
-    except Exception:
-        return None
-
-
-def get_prices(stream: MarketStream, tok_up: str, tok_dn: str) -> Optional[dict]:
-    up = stream.get_midpoint(tok_up) or _rest_mid(tok_up)
-    dn = stream.get_midpoint(tok_dn) or _rest_mid(tok_dn)
-    return {"UP": up, "DOWN": dn} if (up and dn) else None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SHARES PARSER
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _parse_bet_result(resp: dict, fb_price: float, fb_usdc: float):
-    """
-    Extract (shares, usdc) from a BUY response.
-    Uses ROUND_DOWN on fallback to never overestimate shares.
-    """
+def _parse_buy_result(resp: dict, fb_price: float, fb_usdc: float):
     try:
         shares = float(resp.get("takingAmount", 0))
         usdc   = float(resp.get("makingAmount", 0))
@@ -460,144 +519,179 @@ class BotState:
         self.reset()
 
     def reset(self):
-        self.side                : Optional[str]   = None
-        self.token_id            : Optional[str]   = None
-        self.condition_id        : Optional[str]   = None   # for Data API position query
-        self.entry_price         : float           = 0.0
-        self.last_bet_price      : float           = 0.0
-        self.avg_price           : float           = 0.0
-        self.total_shares        : float           = 0.0
-        self.total_spent         : float           = 0.0
-        self.effective_stop_loss : Optional[float] = None
-        self.bets_count          : int             = 0
-        self.in_position         : bool            = False
-        self.tp_order_id         : Optional[str]   = None
-        self.sl_order_id         : Optional[str]   = None
-        self.entry_armed         : bool            = False
-        self._tick_ctr           : int             = 0
+        self.up_bet_count    : int             = 0
+        self.dn_bet_count    : int             = 0
+        self._last_up_bet_ts : float           = 0.0
+        self._last_dn_bet_ts : float           = 0.0
+        self.up_token_id   : Optional[str]     = None
+        self.down_token_id : Optional[str]     = None
+        self.condition_id  : Optional[str]     = None
+        self.up_entry_price: float             = 0.0
+        self.dn_entry_price: float             = 0.0
+        self.up_shares     : float             = 0.0
+        self.dn_shares     : float             = 0.0
+        self.up_cost       : float             = 0.0
+        self.dn_cost       : float             = 0.0
+        self.up_signal     : Optional[MultiSourceSignal] = None
+        self.dn_signal     : Optional[MultiSourceSignal] = None
+        self.tp_order_id_up: Optional[str]     = None
+        self.sl_order_id_up: Optional[str]     = None
+        self.tp_order_id_dn: Optional[str]     = None
+        self.sl_order_id_dn: Optional[str]     = None
+        self.hedge_placed  : bool              = False
 
-    def update_after_bet(self, price: float, usdc: float, shares: float):
-        self.total_shares += shares
-        self.total_spent  += usdc
-        self.avg_price     = self.total_spent / self.total_shares if self.total_shares else price
-        if STOP_LOSS_OFFSET is not None:
-            self.effective_stop_loss = round(self.avg_price - STOP_LOSS_OFFSET, 4)
-        elif STOP_LOSS is not None:
-            self.effective_stop_loss = STOP_LOSS
+    @property
+    def bought_up(self) -> bool:
+        return self.up_bet_count > 0
+
+    @property
+    def bought_down(self) -> bool:
+        return self.dn_bet_count > 0
+
+    def bet_count(self, direction: str) -> int:
+        return self.up_bet_count if direction == "UP" else self.dn_bet_count
+
+    def last_bet_ts(self, direction: str) -> float:
+        return self._last_up_bet_ts if direction == "UP" else self._last_dn_bet_ts
+
+    def update_after_buy(
+        self,
+        direction : str,
+        price     : float,
+        shares    : float,
+        cost      : float,
+        signal    : MultiSourceSignal,
+        token_id  : str,
+    ):
+        now = time.time()
+        if direction == "UP":
+            self.up_bet_count   += 1
+            self._last_up_bet_ts = now
+            self.up_cost        += cost
+            self.up_shares      += shares
+            self.up_entry_price  = self.up_cost / self.up_shares
+            self.up_signal       = signal
+            self.up_token_id     = token_id
         else:
-            self.effective_stop_loss = round(self.avg_price - 0.01, 4)
-        self.last_bet_price = price
-        self.bets_count    += 1
-        self.in_position    = True
+            self.dn_bet_count   += 1
+            self._last_dn_bet_ts = now
+            self.dn_cost        += cost
+            self.dn_shares      += shares
+            self.dn_entry_price  = self.dn_cost / self.dn_shares
+            self.dn_signal       = signal
+            self.down_token_id   = token_id
 
     def summary(self) -> str:
-        sl_tag = "(dyn)" if STOP_LOSS_OFFSET else "(BE)" if SL_BREAKEVEN_MODE else "(fixed)"
-        sl_val = f"{self.effective_stop_loss:.4f}{sl_tag}" if self.effective_stop_loss else "none"
-        mode   = f"DCA STEP={BET_STEP}" if BET_STEP else "Single bet"
-        auto   = "AUTOSET=ON" if AUTOSET_BRACKETS else "AUTOSET=OFF(manual)"
-        return (
-            f"  Side={self.side}  Bets={self.bets_count}  "
-            f"Shares={self.total_shares:.4f}  Spent=${self.total_spent:.4f}  "
-            f"AvgP={self.avg_price:.4f}\n"
-            f"  SL={sl_val}  TP={TAKE_PROFIT}  [{mode}]  {auto}\n"
-            f"  tp_id={self.tp_order_id or 'none'}  "
-            f"sl_id={self.sl_order_id or 'none'}"
-        )
+        lines = ["SOL RSI+VWAP v2 — posición actual:"]
+        if self.bought_up:
+            s = self.up_signal
+            lines.append(
+                f"  UP   @ {self.up_entry_price:.4f} (avg, {self.up_bet_count} BETs)  "
+                f"shares={self.up_shares:.4f}  cost=${self.up_cost:.4f}  "
+                f"[conf={s.confidence:.2f}  consensus={s.consensus_count}/{s.sources_checked}  "
+                f"RSI={s.rsi:.1f}  CL={f'{s.chainlink_price:.2f}' if s.chainlink_price else 'N/A'}]"
+            )
+        if self.bought_down:
+            s = self.dn_signal
+            lines.append(
+                f"  DOWN @ {self.dn_entry_price:.4f} (avg, {self.dn_bet_count} BETs)  "
+                f"shares={self.dn_shares:.4f}  cost=${self.dn_cost:.4f}  "
+                f"[conf={s.confidence:.2f}  consensus={s.consensus_count}/{s.sources_checked}  "
+                f"RSI={s.rsi:.1f}  CL={f'{s.chainlink_price:.2f}' if s.chainlink_price else 'N/A'}]"
+            )
+        return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  BRACKET ORDERS
+#  BRACKET ORDERS  (TP + SL GTC)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def place_brackets(executor: OrderExecutor, state: BotState, tick_size: float):
-    """
-    Cancel old brackets and place new TP+SL GTC orders.
-    Only called when AUTOSET_BRACKETS=True.
-
-    1. Cancel old orders
-    2. Check CTF Exchange allowance
-    3. Query real on-chain position (up to 5 retries, 1s each)
-    4. Place brackets using real balance
-    """
+def place_brackets_for(
+    direction  : str,
+    state      : BotState,
+    executor   : OrderExecutor,
+    tick_size  : float,
+):
+    """Coloca TP y SL GTC para la posición dada."""
     if not AUTOSET_BRACKETS:
-        log.info("  AUTOSET_UP_TP_SL_ORDERS=false — skipping brackets")
+        log.info(f"  AUTOSET=false — brackets no colocados para {direction}")
+        return
+    if TAKE_PROFIT is None:
+        log.info(f"  SOL_RSI_VWAP_TAKE_PROFIT no configurado — skipping bracket TP")
         return
 
-    for oid in [state.tp_order_id, state.sl_order_id]:
-        if oid:
-            try:
-                executor.gtc_tracker.cancel(oid, log)
-            except Exception:
-                pass
-    state.tp_order_id = None
-    state.sl_order_id = None
+    token_id = state.up_token_id if direction == "UP" else state.down_token_id
+    shares   = state.up_shares   if direction == "UP" else state.dn_shares
+    entry    = state.up_entry_price if direction == "UP" else state.dn_entry_price
+    cid      = state.condition_id
 
-    if not check_ctf_allowance(state.token_id):
-        log.error("  Aborting brackets — run approve_ctf.py first")
+    if not token_id or shares < 0.0001:
         return
 
-    shares_to_sell = None
-    for attempt in range(1, 6):
-        real = get_real_position(state.token_id, state.condition_id)
-        if real is not None and real >= 0.0001:
-            if real < state.total_shares:
-                log.warning(
-                    f"  [brackets] on-chain={real:.4f} < estimate={state.total_shares:.4f}"
-                    f" — using on-chain"
-                )
-            else:
-                log.info(f"  [brackets] position confirmed: {real:.4f} shares ✔")
-            shares_to_sell = real
-            break
-        log.info(
-            f"  [brackets] position not settled ({real if real is not None else 'err'})"
-            f" — waiting 1s ({attempt}/5)"
+    # En dry-run no consultamos posición ni enviamos órdenes reales
+    if DRY_RUN:
+        result = _dry_bracket(direction, token_id, shares, TAKE_PROFIT, BRACKET_SL)
+    else:
+        # Verificar shares on-chain (hasta 5 intentos)
+        real = None
+        for attempt in range(1, 6):
+            real = get_real_position(token_id, cid)
+            if real is not None and real >= 0.0001:
+                log.info(f"  [brackets {direction}] shares on-chain: {real:.4f} ✔")
+                break
+            log.info(f"  [brackets {direction}] esperando liquidación ({attempt}/5) ...")
+            time.sleep(1)
+
+        if real is None or real < 0.0001:
+            real = shares
+            log.warning(f"  [brackets {direction}] usando estimado: {real:.4f}")
+
+        result = executor.place_sell_bracket(
+            token_id     = token_id,
+            total_shares = real,
+            tp_price     = TAKE_PROFIT,
+            sl_price     = BRACKET_SL,
+            tick_size    = tick_size,
         )
-        time.sleep(1)
 
-    if shares_to_sell is None:
-        log.warning("  [brackets] using estimate after 5 failed queries")
-        shares_to_sell = state.total_shares
+    if direction == "UP":
+        state.tp_order_id_up = result.get("tp_order_id")
+        state.sl_order_id_up = result.get("sl_order_id")
+    else:
+        state.tp_order_id_dn = result.get("tp_order_id")
+        state.sl_order_id_dn = result.get("sl_order_id")
 
-    if shares_to_sell < 0.0001:
-        log.warning("  [brackets] shares too small — skipping")
-        return
-
-    sl_disp = f"{state.effective_stop_loss:.4f}" if state.effective_stop_loss else "none"
-    sl_tag  = " (BE)" if SL_BREAKEVEN_MODE else ""
     log.info(
-        f"  Placing brackets  TP={TAKE_PROFIT}  "
-        f"SL={sl_disp}{sl_tag}  shares={shares_to_sell:.4f}"
+        f"  [brackets {direction}] TP={TAKE_PROFIT}  "
+        f"SL={BRACKET_SL}  shares={real:.4f}"
     )
-    result = executor.place_sell_bracket(
-        token_id     = state.token_id,
-        total_shares = shares_to_sell,
-        tp_price     = TAKE_PROFIT,
-        sl_price     = state.effective_stop_loss,
-        tick_size    = tick_size,
-    )
-    state.tp_order_id = result.get("tp_order_id")
-    state.sl_order_id = result.get("sl_order_id")
-    if not state.tp_order_id:
-        log.warning("  TP bracket failed — monitoring manually")
-    if state.effective_stop_loss and not state.sl_order_id:
-        log.warning("  SL bracket failed — monitoring manually")
+
+
+def is_order_open(client, order_id: str) -> bool:
+    try:
+        resp   = client.get_order(order_id)
+        status = (resp or {}).get("status", "").upper()
+        return status in ("OPEN", "LIVE", "UNMATCHED", "PENDING")
+    except Exception:
+        return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN WINDOW LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_window(market: dict, executor: OrderExecutor, state: BotState, interval: str):
-    tokens     = parse_market_tokens(market)
-    end_time   = get_market_end_time(market)
-    token_up   = tokens["UP"]["token_id"]
-    token_down = tokens["DOWN"]["token_id"]
-    tick_up    = get_tick_size_rest(executor.client, token_up)
-    tick_down  = get_tick_size_rest(executor.client, token_down)
-    client     = executor.client
-
-    # conditionId — used for precise Data API position queries
+def run_window(
+    market   : dict,
+    executor : OrderExecutor,
+    engine   : MultiSourceEngine,
+    interval : str,
+):
+    tokens       = parse_market_tokens(market)
+    end_time     = get_market_end_time(market)
+    token_up     = tokens["UP"]["token_id"]
+    token_down   = tokens["DOWN"]["token_id"]
+    tick_up      = get_tick_size_rest(executor.client, token_up)
+    tick_down    = get_tick_size_rest(executor.client, token_down)
     condition_id = (
         market.get("conditionId")
         or market.get("condition_id")
@@ -605,300 +699,421 @@ def run_window(market: dict, executor: OrderExecutor, state: BotState, interval:
         or market.get("id")
     )
 
-    sl_cfg   = (
-        f"SL_OFFSET={STOP_LOSS_OFFSET}(dyn)" if STOP_LOSS_OFFSET
-        else "SL=avg(BE)" if SL_BREAKEVEN_MODE
-        else f"SL={STOP_LOSS}(fixed)"
+    window_secs  = WINDOW_SECONDS.get(interval, 300)
+    range_lo, range_hi = PRICE_RANGE
+
+    state = BotState()
+    state.condition_id  = condition_id
+    state.up_token_id   = token_up
+    state.down_token_id = token_down
+
+    rm = RiskManager(
+        window_secs           = window_secs,
+        stop_loss_enabled     = RISK_SL_ENABLED,
+        stop_loss_pct         = RISK_SL_PCT,
+        hedge_enabled         = RISK_HEDGE_EN,
+        hedge_trigger_pct     = RISK_HEDGE_PCT,
+        time_decay_max_pct    = RISK_TIME_PCT,
+        early_bet_window_secs = EARLY_BET_SECS,
+        early_bet_only        = EARLY_BET_ONLY,
     )
-    auto_str = "AUTOSET=ON" if AUTOSET_BRACKETS else "AUTOSET=OFF(manual)"
+    rm.open_window()
 
-    log.info("=" * 60)
-    log.info(f"  SOL DCA  |  Interval={interval.upper()}")
-    log.info(f"  Market   : {market.get('id', '?')}")
-    log.info(f"  Condition: {condition_id}")
-    log.info(f"  End time : {end_time}")
-    log.info(f"  ENTRY={ENTRY_PRICE}  BET=${AMOUNT_PER_BET}  TP={TAKE_PROFIT}")
-    log.info(f"  {sl_cfg}  BET_STEP={BET_STEP}  {auto_str}")
-    log.info(f"  BUY={BUY_ORDER_TYPE}  SELL={SELL_ORDER_TYPE}")
-    log.info("=" * 60)
+    log.info("=" * 65)
+    log.info(f"  SOL RSI+VWAP v2 | Intervalo={interval.upper()}")
+    log.info(f"  Market ID  : {market.get('id', '?')}")
+    log.info(f"  Condition  : {condition_id}")
+    log.info(f"  End time   : {end_time}")
+    log.info(f"  PRICE_RANGE: {range_lo:.2f}–{range_hi:.2f}")
+    log.info(f"  AMOUNT     : ${AMOUNT_TO_BUY:.2f}  TP={TAKE_PROFIT}  SL_bracket={BRACKET_SL}")
+    log.info(f"  ORDER      : {BUY_ORDER_TYPE}  AUTOSET={AUTOSET_BRACKETS}")
+    log.info(f"  PRIME_ZONE : {EARLY_BET_SECS:.0f}s  EARLY_ONLY={EARLY_BET_ONLY}")
+    log.info(f"  RISK_SL    : {RISK_SL_ENABLED}({RISK_SL_PCT*100:.1f}%)")
+    log.info(f"  RISK_HEDGE : {RISK_HEDGE_EN}({RISK_HEDGE_PCT*100:.1f}%)")
+    log.info(f"  MIN_CONS   : {MIN_CONSENSUS}  CANDLE={CANDLE_INTERVAL}")
+    log.info("=" * 65)
 
-    # Open WSS before monitoring begins
+    # ── Abrir stream de precios Polymarket ────────────────────────────────────
     stream = MarketStream(asset_ids=[token_up, token_down])
     stream.start()
-    ready  = stream.wait_ready(timeout=WSS_READY_TIMEOUT)
+    ready = stream.wait_ready(timeout=WSS_READY_TIMEOUT)
     if ready:
         tick_up   = stream.get_tick_size(token_up)   or tick_up
         tick_down = stream.get_tick_size(token_down) or tick_down
-        mu = stream.get_midpoint(token_up)
-        md = stream.get_midpoint(token_down)
-        log.info(
-            f"[WSS] Connected — "
-            f"UP={f'{mu:.4f}' if mu else '?'}  "
-            f"DOWN={f'{md:.4f}' if md else '?'}"
-        )
+        log.info("[Poly WSS] Conectado")
     else:
-        log.warning(f"[WSS] Not ready after {WSS_READY_TIMEOUT}s — REST fallback active")
+        log.warning(f"[Poly WSS] No disponible tras {WSS_READY_TIMEOUT}s — usando REST")
+
+    _tick_ctr = 0
 
     try:
         while True:
             now = datetime.now(timezone.utc)
             if end_time and now >= end_time:
-                log.info("Window closed — cancelling all open orders.")
+                log.info("Ventana cerrada — cancelando órdenes abiertas.")
                 executor.gtc_tracker.cancel_all(log)
                 break
 
             time_left  = (end_time - now).total_seconds() if end_time else 9999
             mins, secs = divmod(int(time_left), 60)
+            zone_label = rm.zone_label()
 
-            tick_up   = stream.get_tick_size(token_up)   or tick_up
-            tick_down = stream.get_tick_size(token_down) or tick_down
+            # ── Precios actuales ──────────────────────────────────────────────
+            up_price   = get_token_price(stream, token_up)
+            down_price = get_token_price(stream, token_down)
 
-            prices = get_prices(stream, token_up, token_down)
-            if prices is None:
-                log.warning("Price unavailable — skipping tick")
+            if up_price is None or down_price is None:
+                log.warning(f"[{mins:02d}:{secs:02d}] Precio no disponible — esperando ...")
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            up_p  = prices["UP"]
-            dn_p  = prices["DOWN"]
-            src   = "WSS" if stream.is_connected else "REST"
+            # ── Señal multi-fuente ────────────────────────────────────────────
+            signal = engine.get_signal(token_up, token_down)
 
-            # ══════════════════════════════════════════════════════════════════
-            #  PHASE 1 — Waiting for entry
-            # ══════════════════════════════════════════════════════════════════
-            if not state.in_position:
+            # ─────────────────────────────────────────────────────────────────
+            #  FASE 1 — Sin posición → evaluar entrada
+            # ─────────────────────────────────────────────────────────────────
+            both_bought = state.bought_up and state.bought_down
+            if not both_bought:
+                can_enter = rm.can_enter()
+                zone      = rm.get_zone()
 
-                if not state.entry_armed:
-                    if up_p < ENTRY_PRICE and dn_p < ENTRY_PRICE:
-                        state.entry_armed = True
+                # Log de estado
+                if signal:
+                    rsi_s  = f"RSI={signal.rsi:.1f}"
+                    sig_s  = f"sig={signal.direction}"
+                    con_s  = f"conf={signal.confidence:.2f}"
+                    con2_s = f"cons={signal.consensus_count}/{signal.sources_checked}"
+                    cl_s   = (f"CL={signal.chainlink_direction}"
+                              if signal.chainlink_available else "CL=off")
+                else:
+                    rsi_s = sig_s = con_s = con2_s = cl_s = "warming"
+
+                log.info(
+                    f"[{mins:02d}:{secs:02d}] [{zone_label}]  "
+                    f"UP={up_price:.4f}  DOWN={down_price:.4f}  "
+                    f"{rsi_s}  {sig_s}  {con_s}  {con2_s}  {cl_s}"
+                )
+
+                if not can_enter:
+                    if zone == WindowZone.LATE:
+                        log.info(f"  LATE ZONE — no nuevas entradas hasta siguiente ventana")
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
+                # ── Evaluar señal y colocar BET ───────────────────────────────
+                if (
+                    signal is not None
+                    and signal.is_actionable
+                    and signal.confidence >= MIN_CONFIDENCE
+                ):
+                    direction   = signal.direction
+                    token_id    = token_up if direction == "UP" else token_down
+                    token_price = up_price if direction == "UP" else down_price
+                    tick_size   = tick_up  if direction == "UP" else tick_down
+                    bet_count = state.bet_count(direction)
+                    last_ts   = state.last_bet_ts(direction)
+
+                    if bet_count >= MAX_BETS_PER_SIDE:
+                        # Límite de entradas alcanzado para esta dirección
+                        time.sleep(POLL_INTERVAL)
+                        continue
+
+                    if bet_count > 0 and (time.time() - last_ts) < BET_COOLDOWN_SECS:
+                        # Cooldown entre BETs no expirado
+                        time.sleep(POLL_INTERVAL)
+                        continue
+
+                    if not (range_lo <= token_price <= range_hi):
                         log.info(
-                            f"  Entry armed — both below {ENTRY_PRICE} "
-                            f"(UP={up_p:.4f} DOWN={dn_p:.4f})"
-                        )
-                    else:
-                        log.info(
-                            f"[{mins:02d}:{secs:02d}]  UP={up_p:.4f}  DOWN={dn_p:.4f}"
-                            f"  | Waiting to arm below ENTRY={ENTRY_PRICE}  {src}"
+                            f"  [{direction}] precio {token_price:.4f} fuera de rango "
+                            f"{range_lo:.2f}–{range_hi:.2f} — saltando"
                         )
                         time.sleep(POLL_INTERVAL)
                         continue
 
-                trig_side = trig_price = None
-                trig_tick = 0.01
-                if up_p >= ENTRY_PRICE:
-                    trig_side, trig_price, trig_tick = "UP",   up_p,  tick_up
-                elif dn_p >= ENTRY_PRICE:
-                    trig_side, trig_price, trig_tick = "DOWN", dn_p,  tick_down
+                    # Obtener best ask para precio de entrada óptimo
+                    best_ask    = signal.best_ask_for(direction)
+                    entry_price = best_ask if best_ask else token_price
 
-                if trig_side:
+                    # Asegurar que el best_ask también está en el rango
+                    if not (range_lo <= entry_price <= range_hi):
+                        entry_price = token_price
+
+                    bet_num  = state.bet_count(direction) + 1
+                    zone_tag = "★PRIME★" if zone == WindowZone.PRIME else "OK"
                     log.info(
-                        f"*** ENTRY: {trig_side} @ {trig_price:.4f} >= {ENTRY_PRICE} ***"
+                        f"*** [{zone_tag}] BET #{bet_num}/{MAX_BETS_PER_SIDE} {direction}  "
+                        f"best_ask={entry_price:.4f}  mid={token_price:.4f}  "
+                        f"RSI={signal.rsi:.1f}  VWAP={signal.vwap:.4f}  "
+                        f"conf={signal.confidence:.2f}  "
+                        f"consensus={signal.consensus_count}/{signal.sources_checked}  "
+                        f"CL_dir={signal.chainlink_direction}  "
+                        f"poly_dir={signal.poly_direction} ***"
                     )
-                    state.side         = trig_side
-                    state.token_id     = token_up if trig_side == "UP" else token_down
-                    state.condition_id = condition_id
-                    state.entry_price  = trig_price
 
-                    resp = executor.place_buy(
-                        token_id  = state.token_id,
-                        price     = trig_price,
-                        usdc_size = AMOUNT_PER_BET,
-                        tick_size = trig_tick,
-                    )
-                    if resp and resp.get("success"):
-                        shares, usdc_paid = _parse_bet_result(resp, trig_price, AMOUNT_PER_BET)
-                        log.info(
-                            f"  BET #1 | shares={shares:.4f}  usdc=${usdc_paid:.4f}"
-                            f"  token={state.token_id[:16]}..."
-                        )
-                        state.update_after_bet(trig_price, usdc_paid, shares)
-                        if AUTOSET_BRACKETS:
-                            place_brackets(executor, state, trig_tick)
-                        else:
-                            log.info(
-                                "  AUTOSET_UP_TP_SL_ORDERS=false — "
-                                "no bracket orders placed, monitoring TP/SL manually"
-                            )
-                        log.info(state.summary())
+                    if DRY_RUN:
+                        resp = _dry_buy(direction, token_id, entry_price, AMOUNT_TO_BUY)
                     else:
-                        log.error(f"  BET #1 failed — {resp}")
-                        state.reset()
-                else:
-                    log.info(
-                        f"[{mins:02d}:{secs:02d}]  UP={up_p:.4f}  DOWN={dn_p:.4f}"
-                        f"  | Armed — waiting for ENTRY={ENTRY_PRICE}  {src}"
-                    )
-
-            # ══════════════════════════════════════════════════════════════════
-            #  PHASE 2 — In position
-            # ══════════════════════════════════════════════════════════════════
-            else:
-                cp        = up_p  if state.side == "UP" else dn_p
-                tick_size = tick_up if state.side == "UP" else tick_down
-                sl_d      = f"{state.effective_stop_loss:.4f}" if state.effective_stop_loss else "none"
-                log.info(
-                    f"[{mins:02d}:{secs:02d}]  {state.side}={cp:.4f}"
-                    f"  AvgP={state.avg_price:.4f}  SL={sl_d}  TP={TAKE_PROFIT}"
-                    f"  Shares={state.total_shares:.4f}  {src}"
-                )
-
-                # ── Detect silent bracket fills every 8 ticks ──────────────────
-                state._tick_ctr += 1
-                if state._tick_ctr >= 8:
-                    state._tick_ctr = 0
-                    if state.tp_order_id and not is_order_open(client, state.tp_order_id):
-                        pnl = (TAKE_PROFIT - state.avg_price) * state.total_shares
-                        log.info(
-                            f"*** TP FILLED (detected) | TP={TAKE_PROFIT}"
-                            f"  AvgP={state.avg_price:.4f}  Est P&L=+${pnl:.4f} ***"
-                        )
-                        executor.gtc_tracker.cancel_all(log)
-                        break
-                    if state.sl_order_id and not is_order_open(client, state.sl_order_id):
-                        sl_p = state.effective_stop_loss
-                        pnl  = (sl_p - state.avg_price) * state.total_shares
-                        log.info(
-                            f"*** SL FILLED (detected) | SL={sl_p:.4f}"
-                            f"  AvgP={state.avg_price:.4f}  Est P&L=${pnl:.4f} ***"
-                        )
-                        executor.gtc_tracker.cancel_all(log)
-                        break
-
-                # ── Manual TP ──────────────────────────────────────────────────
-                if not state.tp_order_id and cp >= TAKE_PROFIT:
-                    log.info(f"*** TP (manual): {state.side}={cp:.4f} >= {TAKE_PROFIT} ***")
-                    executor.gtc_tracker.cancel_all(log)
-                    real = get_real_position(state.token_id, state.condition_id)
-                    sell = real if (real is not None and real > 0) else state.total_shares
-                    resp = executor.place_sell_immediate(
-                        token_id      = state.token_id,
-                        total_shares  = sell,
-                        current_price = cp,
-                        tick_size     = tick_size,
-                    )
-                    if resp:
-                        pnl = (cp - state.avg_price) * sell
-                        log.info(f"  CLOSED (TP manual) | Est P&L=+${pnl:.4f}")
-                        break
-                    time.sleep(POLL_INTERVAL)
-                    continue
-
-                # ── Manual SL ──────────────────────────────────────────────────
-                if (
-                    not state.sl_order_id
-                    and state.effective_stop_loss is not None
-                    and cp <= state.effective_stop_loss
-                ):
-                    sl_tag = (
-                        "(BE)"      if SL_BREAKEVEN_MODE
-                        else "(dyn)" if STOP_LOSS_OFFSET
-                        else "(fixed)"
-                    )
-                    log.info(
-                        f"*** SL {sl_tag} (manual): {state.side}={cp:.4f}"
-                        f" <= {state.effective_stop_loss:.4f} ***"
-                    )
-                    executor.gtc_tracker.cancel_all(log)
-                    real = get_real_position(state.token_id, state.condition_id)
-                    sell = real if (real is not None and real > 0) else state.total_shares
-                    resp = executor.place_sell_immediate(
-                        token_id      = state.token_id,
-                        total_shares  = sell,
-                        current_price = cp,
-                        tick_size     = tick_size,
-                    )
-                    if resp:
-                        pnl = (cp - state.avg_price) * sell
-                        log.info(f"  CLOSED (SL manual) | Est P&L=${pnl:.4f}")
-                        break
-                    time.sleep(POLL_INTERVAL)
-                    continue
-
-                # ── DCA ────────────────────────────────────────────────────────
-                if BET_STEP is not None:
-                    next_bet = round(state.last_bet_price + BET_STEP, 4)
-                    if cp >= next_bet:
-                        log.info(
-                            f"*** DCA #{state.bets_count + 1}: "
-                            f"{state.side}={cp:.4f} >= {next_bet:.4f} ***"
-                        )
                         resp = executor.place_buy(
-                            token_id  = state.token_id,
-                            price     = cp,
-                            usdc_size = AMOUNT_PER_BET,
+                            token_id  = token_id,
+                            price     = entry_price,
+                            usdc_size = AMOUNT_TO_BUY,
                             tick_size = tick_size,
                         )
-                        if resp and resp.get("success"):
-                            shares, usdc_paid = _parse_bet_result(resp, cp, AMOUNT_PER_BET)
-                            log.info(
-                                f"  DCA filled | shares={shares:.4f}  usdc=${usdc_paid:.4f}"
-                            )
-                            state.update_after_bet(cp, usdc_paid, shares)
-                            if AUTOSET_BRACKETS:
-                                place_brackets(executor, state, tick_size)
-                            log.info(state.summary())
+
+                    if resp and resp.get("success"):
+                        shares, cost = _parse_buy_result(resp, entry_price, AMOUNT_TO_BUY)
+                        state.update_after_buy(direction, entry_price, shares, cost, signal, token_id)
+                        avg_entry = (state.up_entry_price if direction == "UP"
+                                     else state.dn_entry_price)
+                        if state.bet_count(direction) == 1:
+                            rm.set_position(avg_entry=avg_entry)
                         else:
-                            log.error(f"  DCA failed — {resp}")
+                            rm.update_avg_entry(avg_entry)
+                        log.info(
+                            f"  ✔ {direction} comprado | "
+                            f"shares={shares:.4f}  cost=${cost:.4f}  "
+                            f"entry={entry_price:.4f}"
+                        )
+                        log.info(state.summary())
+
+                        if AUTOSET_BRACKETS:
+                            if state.bet_count(direction) > 1:
+                                # Cancelar brackets previos antes de re-colocar con total de shares
+                                if direction == "UP":
+                                    for oid in [state.tp_order_id_up, state.sl_order_id_up]:
+                                        if oid:
+                                            try: executor.client.cancel_order(oid)
+                                            except Exception: pass
+                                    state.tp_order_id_up = None
+                                    state.sl_order_id_up = None
+                                else:
+                                    for oid in [state.tp_order_id_dn, state.sl_order_id_dn]:
+                                        if oid:
+                                            try: executor.client.cancel_order(oid)
+                                            except Exception: pass
+                                    state.tp_order_id_dn = None
+                                    state.sl_order_id_dn = None
+                            place_brackets_for(direction, state, executor, tick_size)
+                    else:
+                        log.error(f"  ✗ BET {direction} falló | resp={resp}")
+
+            # ─────────────────────────────────────────────────────────────────
+            #  FASE 2 — En posición → gestión de riesgo
+            # ─────────────────────────────────────────────────────────────────
+            else:
+                log.info(
+                    f"[{mins:02d}:{secs:02d}] Ambos lados comprados — "
+                    f"UP={up_price:.4f}  DOWN={down_price:.4f}  "
+                    f"[{zone_label}]"
+                )
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            # ── Gestión de riesgo para la posición UP (si está abierta) ──────
+            if state.bought_up:
+                cp        = up_price
+                tick_size = tick_up
+                risk_st   = rm.check_position(cp)
+
+                _tick_ctr += 1
+
+                # Detección silenciosa de bracket fills (cada 8 ticks)
+                if _tick_ctr >= 8:
+                    _tick_ctr = 0
+                    if state.tp_order_id_up and not is_order_open(executor.client, state.tp_order_id_up):
+                        pnl = (TAKE_PROFIT - state.up_entry_price) * state.up_shares if TAKE_PROFIT else 0
+                        log.info(f"*** TP UP FILLED (detectado) | est P&L=+${pnl:.4f} ***")
+                        executor.gtc_tracker.cancel_all(log)
+                        break
+                    if state.sl_order_id_up and not is_order_open(executor.client, state.sl_order_id_up):
+                        log.info("*** SL UP FILLED (detectado) ***")
+                        executor.gtc_tracker.cancel_all(log)
+                        break
+
+                # TP manual (sin bracket)
+                if TAKE_PROFIT and not state.tp_order_id_up and cp >= TAKE_PROFIT:
+                    log.info(f"*** TP manual UP: {cp:.4f} >= {TAKE_PROFIT} ***")
+                    if not DRY_RUN:
+                        executor.gtc_tracker.cancel_all(log)
+                        real = get_real_position(state.up_token_id, condition_id)
+                        sell = real if (real and real > 0) else state.up_shares
+                        executor.place_sell_immediate(state.up_token_id, sell, cp, tick_size)
+                    else:
+                        _dry_sell("TP manual", state.up_token_id, state.up_shares, cp)
+                    break
+
+                # Stop-loss dinámico post-entrada
+                if risk_st.event == RiskEvent.STOP_LOSS:
+                    log.warning(
+                        f"*** RISK SL UP — price={cp:.4f}  "
+                        f"SL_level={risk_st.sl_level:.4f}  "
+                        f"P&L={risk_st.pnl_pct*100:.2f}% ***"
+                    )
+                    if DRY_RUN:
+                        _dry_sell("STOP LOSS", state.up_token_id, state.up_shares, cp)
+                        log.info(f"  [DRY RUN] UP cerrado por stop-loss | price={cp:.4f}")
+                        break
+                    executor.gtc_tracker.cancel_all(log)
+                    real = get_real_position(state.up_token_id, condition_id)
+                    sell = real if (real and real > 0) else state.up_shares
+                    resp = executor.place_sell_immediate(state.up_token_id, sell, cp, tick_size)
+                    if resp:
+                        log.info(f"  ✔ UP cerrado por stop-loss | price={cp:.4f}")
+                        break
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
+                # Hedge automático
+                if (
+                    risk_st.event == RiskEvent.HEDGE
+                    and not state.hedge_placed
+                    and not state.bought_down
+                ):
+                    log.warning(
+                        f"*** HEDGE triggered UP — comprando DOWN como cobertura  "
+                        f"price={down_price:.4f}  "
+                        f"P&L={risk_st.pnl_pct*100:.2f}% ***"
+                    )
+                    if range_lo <= down_price <= range_hi:
+                        if DRY_RUN:
+                            resp_h = _dry_buy("DOWN (hedge)", token_down, down_price, AMOUNT_TO_BUY)
+                        else:
+                            resp_h = executor.place_buy(
+                                token_id  = token_down,
+                                price     = down_price,
+                                usdc_size = AMOUNT_TO_BUY,
+                                tick_size = tick_down,
+                            )
+                        if resp_h and resp_h.get("success"):
+                            shares_h, cost_h = _parse_buy_result(resp_h, down_price, AMOUNT_TO_BUY)
+                            if signal:
+                                state.update_after_buy(
+                                    "DOWN", down_price, shares_h, cost_h, signal, token_down
+                                )
+                            state.hedge_placed = True
+                            log.info(
+                                f"  ✔ HEDGE DOWN comprado | "
+                                f"shares={shares_h:.4f}  cost=${cost_h:.4f}"
+                            )
+                    else:
+                        log.warning(
+                            f"  Hedge cancelado — DOWN={down_price:.4f} fuera de rango "
+                            f"{range_lo:.2f}–{range_hi:.2f}"
+                        )
 
             time.sleep(POLL_INTERVAL)
 
     finally:
-        log.info("[WSS] Closing stream.")
         stream.stop()
+        log.info("[Poly WSS] Stream cerrado.")
 
-    log.info("Window loop ended.")
+    if state.bought_up or state.bought_down:
+        log.info(state.summary())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run(interval: Optional[str] = None):
+def run(interval: Optional[str] = None, dry_run: Optional[bool] = None):
+    # El parámetro dry_run (de main.py --dry-run) sobreescribe la variable de entorno
+    global DRY_RUN
+    if dry_run is not None:
+        DRY_RUN = dry_run
+
     if interval is None:
         try:
             import questionary
             choice = questionary.select(
-                "Select market interval:",
-                choices=["5 minutes", "15 minutes", "1 hour"],
+                "Selecciona el intervalo de mercado:",
+                choices=["5 minutos", "15 minutos", "1 hora"],
             ).ask()
             if choice is None:
                 sys.exit(0)
-            interval = "1h" if "hour" in choice else "15m" if "15" in choice else "5m"
+            interval = "1h" if "hora" in choice else "15m" if "15" in choice else "5m"
         except (ImportError, Exception):
             while True:
-                raw = input("Interval — enter 5, 15, or 60: ").strip()
+                raw = input("Intervalo — escribe 5, 15, o 60: ").strip()
                 if raw == "5":  interval = "5m";  break
                 if raw == "15": interval = "15m"; break
                 if raw == "60": interval = "1h";  break
 
-    sl_cfg = (
-        f"SL_OFFSET={STOP_LOSS_OFFSET}(dyn)" if STOP_LOSS_OFFSET
-        else "SL=avg(BE)" if SL_BREAKEVEN_MODE
-        else f"SL={STOP_LOSS}(fixed)"
+    # Preguntar dry-run si se ejecuta directamente y no se especificó
+    if dry_run is None and not os.getenv("SOL_RSI_VWAP_DRY_RUN"):
+        try:
+            import questionary
+            resp = questionary.confirm(
+                "¿Ejecutar en modo DRY RUN? (sin órdenes reales)",
+                default=False,
+            ).ask()
+            if resp is not None:
+                DRY_RUN = resp
+        except (ImportError, Exception):
+            raw = input("DRY RUN? [s/N]: ").strip().lower()
+            DRY_RUN = raw in ("s", "y", "si", "yes", "1")
+
+    rpc_url = os.getenv("POLY_RPC", "")
+    dry_tag = "  ⚠  DRY RUN — NO se enviarán órdenes reales" if DRY_RUN else ""
+
+    log.info("=" * 65)
+    log.info("SOL RSI+VWAP v2 — Multi-Source Strategy")
+    if DRY_RUN:
+        log.info("  *** DRY RUN — SIMULACIÓN SIN FONDOS REALES ***")
+    log.info(f"  Mercado   : SOL {interval.upper()}")
+    log.info(f"  Velas     : {CANDLE_INTERVAL}")
+    log.info(f"  RSI       : periodo={RSI_PERIOD}  OB={RSI_OVERBOUGHT}  OS={RSI_OVERSOLD}")
+    log.info(f"  Umbrales  : bull>{RSI_BULL_THRESHOLD}  bear<{RSI_BEAR_THRESHOLD}")
+    log.info(f"  Conf min  : {MIN_CONFIDENCE}")
+    log.info(f"  ChainLink : {'ACTIVO' if CL_ENABLED and rpc_url else 'INACTIVO (sin POLY_RPC)'}")
+    log.info(f"  Consenso  : min {MIN_CONSENSUS} fuentes")
+    log.info(f"  Rango     : {PRICE_RANGE[0]:.2f}–{PRICE_RANGE[1]:.2f}")
+    log.info(f"  Amount    : ${AMOUNT_TO_BUY:.2f}")
+    log.info(f"  DRY RUN   : {DRY_RUN}")
+    log.info("=" * 65)
+
+    # ── Construir MultiSourceEngine ───────────────────────────────────────────
+    engine = MultiSourceEngine(
+        asset              = "sol",
+        rpc_url            = rpc_url,
+        rsi_period         = RSI_PERIOD,
+        rsi_overbought     = RSI_OVERBOUGHT,
+        rsi_oversold       = RSI_OVERSOLD,
+        rsi_bull_threshold = RSI_BULL_THRESHOLD,
+        rsi_bear_threshold = RSI_BEAR_THRESHOLD,
+        min_confidence     = MIN_CONFIDENCE,
+        interval           = CANDLE_INTERVAL,
+        chainlink_enabled  = CL_ENABLED and bool(rpc_url),
+        cl_poll_interval   = CL_POLL_INT,
+        cl_lookback_secs   = CL_LOOKBACK,
+        cl_max_divergence  = CL_MAX_DIV,
+        cl_min_change_pct  = CL_MIN_CHANGE,
+        poly_signal_thresh = POLY_SIG_THRESH,
+        min_consensus      = MIN_CONSENSUS,
     )
-    log.info("=" * 60)
-    log.info("SOL DCA Snipe bot starting")
-    log.info(f"  Interval  : {interval.upper()}")
-    log.info(f"  ENTRY={ENTRY_PRICE}  BET=${AMOUNT_PER_BET}  TP={TAKE_PROFIT}")
-    log.info(f"  {sl_cfg}  BET_STEP={BET_STEP}")
-    log.info(f"  BUY={BUY_ORDER_TYPE}  SELL={SELL_ORDER_TYPE}")
-    log.info(f"  AUTOSET_UP_TP_SL_ORDERS={AUTOSET_BRACKETS}")
-    log.info("=" * 60)
+
+    log.info("Pre-cargando velas históricas de Binance ...")
+    preload_history(engine.binance, lookback_candles=50)
+
+    engine.start()
+    log.info("Engine multi-fuente arrancado — esperando primera señal ...")
 
     client   = build_clob_client()
     executor = OrderExecutor(client=client, log=log)
-    log.info("CLOB client authenticated OK")
+    log.info("CLOB client autenticado ✔")
 
+    # ── Loop principal: ventana por ventana ───────────────────────────────────
     while True:
-        state  = BotState()
         market = wait_for_active_market(interval)
-        run_window(market, executor, state, interval)
+        run_window(market, executor, engine, interval)
+
         end_time  = get_market_end_time(market)
         wait_secs = 30
         if end_time:
             remaining = (end_time - datetime.now(timezone.utc)).total_seconds()
             wait_secs = max(5, remaining + 5)
-        log.info(f"Waiting {wait_secs:.0f}s for next window ...")
+        log.info(f"Esperando {wait_secs:.0f}s para la siguiente ventana ...")
         time.sleep(wait_secs)
 
 

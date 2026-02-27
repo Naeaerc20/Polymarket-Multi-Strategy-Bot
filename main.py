@@ -314,7 +314,7 @@ Examples:
         "--dry-run",
         action="store_true",
         default=False,
-        help="Copy-Trade only: log trades without placing real orders",
+        help="Log trades without placing real orders (all strategies)",
     )
     return parser.parse_args()
 
@@ -337,11 +337,12 @@ def main():
     # ── Market selection ───────────────────────────────────────────────────────
     run_kwargs = {}
 
+    if args.dry_run:
+        run_kwargs["dry_run"] = True
+
     if not strategy_cfg["needs_markets"]:
         # Copy-Trade: single bot, no per-market files
         markets = ["all"]
-        if args.dry_run:
-            run_kwargs["dry_run"] = True
     else:
         if args.operate:
             raw = [m.lower() for m in args.operate]
